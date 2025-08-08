@@ -1,0 +1,2 @@
+# RagsApp
+RAG in WhatsApp
