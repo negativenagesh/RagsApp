@@ -2,6 +2,24 @@
 	<img src="RagsApp-logo/cover.png" alt="RagsApp Logo" width="800"/>
 </p>
 
+<p align="center">
+  <a href="https://github.com/negativenagesh/RagsApp/stargazers">
+    <img src="https://img.shields.io/github/stars/negativenagesh/RagsApp?style=flat&logo=github" alt="Stars">
+  </a>
+  <a href="https://github.com/negativenagesh/RagsApp/network/members">
+    <img src="https://img.shields.io/github/forks/negativenagesh/RagsApp?style=flat&logo=github" alt="Forks">
+  </a>
+  <a href="https://github.com/negativenagesh/RagsApp/pulls">
+    <img src="https://img.shields.io/github/issues-pr/negativenagesh/RagsApp?style=flat&logo=github" alt="Pull Requests">
+  </a>
+  <a href="https://github.com/negativenagesh/RagsApp/issues">
+    <img src="https://img.shields.io/github/issues/negativenagesh/RagsApp?style=flat&logo=github" alt="Issues">
+  </a>
+  <a href="https://github.com/negativenagesh/RagsApp/blob/main/LICENSE">
+    <img src="https://img.shields.io/github/license/negativenagesh/RagsApp?style=flat&logo=github" alt="License">
+  </a>
+</p>
+
 WhatsApp-first RAG with Elasticsearch Cloud, split into Python microservices:
 
 - Ingestion Service (FastAPI): extracts text from user files, chunks, embeds with OpenAI, and indexes vectors into Elasticsearch dense_vector.
