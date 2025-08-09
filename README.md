@@ -1,4 +1,6 @@
-# RagsApp
+<p align="center">
+	<img src="RagsApp-logo/cover.png" alt="RagsApp Logo" width="800"/>
+</p>
 
 WhatsApp-first RAG with Elasticsearch Cloud, split into Python microservices:
 
