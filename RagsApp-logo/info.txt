@@ -1,0 +1,11 @@
+
+Hope you enjoy your new logo, here are the people that
+made your beautiful logo happen :)
+font name: kimberley_bl
+font link: https://www.fontspring.com/fonts/typodermic/kimberley
+font author: Typodermic
+font author site: http://typodermicfonts.com/
+
+
+{"bg-gradient-0":"#5A0E1D","bg-gradient-1":"#B39984","icon":"#ffffff","font":"#ffffff","slogan":"#ffffff"}
+      
