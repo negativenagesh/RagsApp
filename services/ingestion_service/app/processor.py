@@ -20,10 +20,10 @@ import tiktoken
 from openai import AsyncOpenAI
 from elasticsearch.helpers import async_bulk, BulkIndexError
 
-from ..parsers.pdf_parser import PDFParser
-from ..parsers.ocr_parser import OCRParser
-from ..parsers.csv_parser import CSVParser
-from ..parsers.xlsx_parser import XLSXParser
+from parsers.pdf_parser import PDFParser
+from parsers.ocr_parser import OCRParser
+from parsers.csv_parser import CSVParser
+from parsers.xlsx_parser import XLSXParser
 from .es_client import ensure_es_index_exists
 from .es_client import CHUNKED_PDF_MAPPINGS
 
