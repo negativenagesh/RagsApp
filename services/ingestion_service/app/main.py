@@ -40,7 +40,7 @@ async def shutdown_event():
     if app.state.openai_client:
         print("OpenAI client shutdown.")
 
-@app.post("/ingest/")
+@app.post("/ingest")
 async def ingest_file(
     description: str = Form(""),
     is_ocr_pdf: bool = Form(False),
