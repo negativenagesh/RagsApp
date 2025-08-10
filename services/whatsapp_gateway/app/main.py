@@ -1,4 +1,5 @@
 import os
+from pydoc import text
 from fastapi import FastAPI, Request, HTTPException, Query
 from dotenv import load_dotenv
 from app.rag_client import ask_rag
@@ -16,6 +17,7 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
 
+RAG_INTENT_URL = os.getenv("RAG_INTENT_URL", "http://localhost:8001/classify-intent")
 
 app = FastAPI(title="WhatsApp Gateway for RagsApp")
 
@@ -56,6 +58,16 @@ def split_message(text, max_length=4096):
         messages.append(current)
     return messages
 
+async def get_intent(question: str) -> str:
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(RAG_INTENT_URL, json={"question": question}, timeout=30)
+            data = resp.json()
+            return data.get("intent", "retrieval")
+    except Exception as e:
+        print(f"get_intent error: {e}")
+        return "retrieval"
+
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request):
     data = await request.json()
@@ -92,9 +104,14 @@ async def whatsapp_webhook(request: Request):
             print(f"User text: {text}")
 
             # 1. Send "thinking..." message immediately
-            await send_whatsapp_message(from_number, "🤖 Thinking... Please wait while I process your request.")
+            intent = await get_intent(text)
+            print(f"User intent: {intent}")
 
-            # 2. Now call RAG/LLM
+            # 2. Only send "thinking..." if intent is retrieval
+            if intent == "retrieval":
+                await send_whatsapp_message(from_number, "🤖 Thinking... Please wait while I process your request.")
+
+            # 3. Now call RAG/LLM (always, for all intents)
             answer = await ask_rag(text)
             if isinstance(answer, dict):
                 if "final_answer" in answer:

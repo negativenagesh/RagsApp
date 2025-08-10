@@ -1226,119 +1226,196 @@ Output:
         final_results_dict["llm_formatted_context"] = llm_formatted_context + citations_str
         
         return final_results_dict
+
+async def classify_intent_llm(query: str, aclient_openai: AsyncOpenAI) -> str:
+    """
+    Uses LLM to classify the user's intent.
+    Returns one of: 'greeting', 'irrelevant', 'retrieval'
+    """
+    system_prompt = (
+        "You are an expert intent classifier for a document Q&A bot. "
+        "Classify the user's message as one of the following:\n"
+        "- greeting: If the message is a greeting (hi, hello, hey, etc.)\n"
+        "- irrelevant: If the message is nonsensical, off-topic, or not a real question (e.g., 'asdf', 'what is the color of my socks?', 'tell me a joke', 'who is the president of mars?')\n"
+        "- retrieval: If the message is a real, information-seeking question about the user's documents or data.\n"
+        "Respond ONLY with one of: greeting, irrelevant, retrieval."
+    )
+    user_prompt = f"User message: \"{query.strip()}\""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    try:
+        response = await aclient_openai.chat.completions.create(
+            model=OPENAI_CHAT_MODEL,
+            messages=messages,
+            max_tokens=2,
+            temperature=0.0,
+        )
+        result = response.choices[0].message.content.strip().lower()
+        return result
+    except Exception as e:
+        print(f"LLM intent classifier error: {e}")
+        return "retrieval"
     
 async def handle_request(data: Message) -> FunctionResponse:
-  es_client: Optional[AsyncElasticsearch] = None
-  aclient_openai: Optional[AsyncOpenAI] = None
-  
-  try:
-    print('Incoming Data:--', data)
-    params = data.params
-    config = data.config
+    """
+    Handles a user query by:
+    - Using LLM to classify intent (greeting, irrelevant, retrieval)
+    - Responding with LLM for greetings/irrelevant queries
+    - Running full RAG pipeline for retrieval queries
+    """
+    es_client: Optional[AsyncElasticsearch] = None
+    aclient_openai: Optional[AsyncOpenAI] = None
 
-    # Check if this is a request to generate a final answer from context
-    if params.get('generate_final_answer') and params.get('context') and params.get('question'):
-      aclient_openai = await init_async_openai_client()
-      if not aclient_openai:
-        return FunctionResponse(False, "Could not connect to OpenAI for final answer generation.")
-        
-      # Create a simple retriever just for answer generation
-      retriever = RAGFusionRetriever(params, config, None, aclient_openai)
-      
-      context = params.get('context')
-      query = params.get('question')
-      
-      # Extract cited files from context if available
-      cited_files = []
-      if "**Sources:**" in context:
-        sources_section = context.split("**Sources:**")[1].split("\n\n")[0]
-        cited_files = [line.replace("- ", "").strip() for line in sources_section.strip().split("\n")]
-      
-      # Generate the final answer
-      final_answer = await retriever._generate_final_answer(
-        original_query=query,
-        llm_formatted_context=context,
-        cited_files=cited_files
-      )
-      
-      if aclient_openai and hasattr(aclient_openai, "aclose"):
-        await aclient_openai.aclose()
-        print("OpenAI client closed.")
-        
-      return FunctionResponse(message=Messages({"final_answer": final_answer}), failed=False)
-    
-    # Regular search request processing
-    es_client = await get_es_client()
-    if not es_client:
-      return FunctionResponse(False, "Could not connect to Elasticsearch.")
-    
-    aclient_openai = await init_async_openai_client()
-    if not aclient_openai:
-        return FunctionResponse(False, "Could not connect to Open Ai.")
+    try:
+        print('Incoming Data:--', data)
+        params = data.params
+        config = data.config
 
-    retriever = RAGFusionRetriever(params, config, es_client, aclient_openai)
-    user_query_input = params.get('question')
-    
-    # Define query_type before using it
-    query_type = await retriever._classify_query_type(user_query_input)
-    # Get top_k_chunks from params or use default
-    top_k_chunks = await retriever._determine_optimal_chunk_count(user_query_input, query_type)
-    
-    print(f"\n--- Running RAG Fusion Search for: '{user_query_input}' ---")
-    search_results_dict = await retriever.search(
-        user_query=user_query_input, 
-        initial_candidate_pool_size=top_k_chunks, 
-        top_k_kg_entities=top_k_chunks, 
-        absolute_score_floor=0.3
-    )
-    print("\n--- Search Results Dictionary (RAG Fusion: Chunks & KG Reranked if applicable) ---")
-    
-    if es_client and hasattr(es_client, 'close'):
-      await es_client.close()
-      print("Elasticsearch client closed.")
-    if aclient_openai and hasattr(aclient_openai, "aclose"):
-        print('open ai client close')
-        try:
-          await aclient_openai.aclose()
-          print("OpenAI client closed.")
-        except Exception as e:
-          print(f"Error closing OpenAI client: {e}")
-    
-    if search_results_dict is None:
-        print("❌ Warning: search_results_dict is None")
-        return FunctionResponse(message=Messages("An error occurred during search. No results returned."), failed=True)
-    
-    # For direct queries, generate final answer automatically
-    if not params.get('skip_final_answer', False):
-      llm_formatted_context = search_results_dict.get("llm_formatted_context", "")
-      cited_files = []
-      if "refrences" in search_results_dict:
-        refs_text = search_results_dict["refrences"]
-        if refs_text and "**Sources:**" in refs_text:
-          sources_section = refs_text.split("**Sources:**")[1].split("\n\n")[0]
-          cited_files = [line.replace("- ", "").strip() for line in sources_section.strip().split("\n")]
-      
-      # Generate final answer
-      aclient_openai = await init_async_openai_client()
-      if aclient_openai:
-        retriever = RAGFusionRetriever(params, config, None, aclient_openai)
-        final_answer = await retriever._generate_final_answer(
-          original_query=user_query_input,
-          llm_formatted_context=llm_formatted_context,
-          cited_files=cited_files
+        # Special case: Only generate final answer from provided context
+        if params.get('generate_final_answer') and params.get('context') and params.get('question'):
+            aclient_openai = await init_async_openai_client()
+            if not aclient_openai:
+                return FunctionResponse(False, "Could not connect to OpenAI for final answer generation.")
+
+            retriever = RAGFusionRetriever(params, config, None, aclient_openai)
+            context = params.get('context')
+            query = params.get('question')
+
+            # Extract cited files from context if available
+            cited_files = []
+            if "**Sources:**" in context:
+                sources_section = context.split("**Sources:**")[1].split("\n\n")[0]
+                cited_files = [line.replace("- ", "").strip() for line in sources_section.strip().split("\n")]
+
+            final_answer = await retriever._generate_final_answer(
+                original_query=query,
+                llm_formatted_context=context,
+                cited_files=cited_files
+            )
+
+            if aclient_openai and hasattr(aclient_openai, "aclose"):
+                await aclient_openai.aclose()
+                print("OpenAI client closed.")
+
+            return FunctionResponse(message=Messages({"final_answer": final_answer}), failed=False)
+
+        # --- Regular search request processing ---
+        es_client = await get_es_client()
+        if not es_client:
+            return FunctionResponse(False, "Could not connect to Elasticsearch.")
+
+        aclient_openai = await init_async_openai_client()
+        if not aclient_openai:
+            return FunctionResponse(False, "Could not connect to Open Ai.")
+
+        retriever = RAGFusionRetriever(params, config, es_client, aclient_openai)
+        user_query_input = params.get('question', '').strip()
+
+        # --- LLM Intent Classification ---
+        intent = await classify_intent_llm(user_query_input, aclient_openai)
+        print(f"LLM classified intent: {intent}")
+
+        if intent == "greeting":
+            # Friendly greeting response
+            system_prompt = (
+                "You are a friendly, helpful AI assistant for RagsApp. "
+                "If the user greets you, respond with a warm, concise greeting and offer to help with questions about their documents or data."
+            )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_query_input}
+            ]
+            response = await aclient_openai.chat.completions.create(
+                model=OPENAI_CHAT_MODEL,
+                messages=messages,
+                max_tokens=60,
+                temperature=0.7,
+            )
+            greeting_response = response.choices[0].message.content.strip()
+            if aclient_openai and hasattr(aclient_openai, "aclose"):
+                await aclient_openai.aclose()
+            return FunctionResponse(message=Messages({"final_answer": greeting_response}), failed=False)
+
+        if intent == "irrelevant":
+            # Polite fallback for nonsense/irrelevant queries
+            system_prompt = (
+                "You are a polite, professional AI assistant for RagsApp. "
+                "If the user's message is nonsensical, off-topic, or not a real question, respond with a gentle message like: "
+                "'I'm here to help with questions about your documents or data. Please ask a relevant question.'"
+            )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_query_input}
+            ]
+            response = await aclient_openai.chat.completions.create(
+                model=OPENAI_CHAT_MODEL,
+                messages=messages,
+                max_tokens=60,
+                temperature=0.7,
+            )
+            fallback_response = response.choices[0].message.content.strip()
+            if aclient_openai and hasattr(aclient_openai, "aclose"):
+                await aclient_openai.aclose()
+            return FunctionResponse(message=Messages({"final_answer": fallback_response}), failed=False)
+
+        # --- Retrieval intent: Run full RAG pipeline ---
+        query_type = await retriever._classify_query_type(user_query_input)
+        top_k_chunks = await retriever._determine_optimal_chunk_count(user_query_input, query_type)
+
+        print(f"\n--- Running RAG Fusion Search for: '{user_query_input}' ---")
+        search_results_dict = await retriever.search(
+            user_query=user_query_input,
+            initial_candidate_pool_size=top_k_chunks,
+            top_k_kg_entities=top_k_chunks,
+            absolute_score_floor=0.3
         )
-        
+        print("\n--- Search Results Dictionary (RAG Fusion: Chunks & KG Reranked if applicable) ---")
+
+        if es_client and hasattr(es_client, 'close'):
+            await es_client.close()
+            print("Elasticsearch client closed.")
         if aclient_openai and hasattr(aclient_openai, "aclose"):
-          await aclient_openai.aclose()
-          
-        return FunctionResponse(message=Messages({"final_answer": final_answer}), failed=False)
-    
-    # If skip_final_answer is true or if we couldn't generate one, return formatted context
-    return FunctionResponse(message=Messages(search_results_dict.get("llm_formatted_context", "No formatted context generated.")), failed=False)
-    
-  except Exception as e:
-    print(f"❌ Error during retrieval: {e}")
-    return FunctionResponse(message=Messages({"error": str(e)}), failed=True)
+            try:
+                await aclient_openai.aclose()
+                print("OpenAI client closed.")
+            except Exception as e:
+                print(f"Error closing OpenAI client: {e}")
+
+        if search_results_dict is None:
+            print("❌ Warning: search_results_dict is None")
+            return FunctionResponse(message=Messages("An error occurred during search. No results returned."), failed=True)
+
+        # For direct queries, generate final answer automatically
+        if not params.get('skip_final_answer', False):
+            llm_formatted_context = search_results_dict.get("llm_formatted_context", "")
+            cited_files = []
+            if "refrences" in search_results_dict:
+                refs_text = search_results_dict["refrences"]
+                if refs_text and "**Sources:**" in refs_text:
+                    sources_section = refs_text.split("**Sources:**")[1].split("\n\n")[0]
+                    cited_files = [line.replace("- ", "").strip() for line in sources_section.strip().split("\n")]
+
+            # Generate final answer
+            aclient_openai = await init_async_openai_client()
+            if aclient_openai:
+                retriever = RAGFusionRetriever(params, config, None, aclient_openai)
+                final_answer = await retriever._generate_final_answer(
+                    original_query=user_query_input,
+                    llm_formatted_context=llm_formatted_context,
+                    cited_files=cited_files
+                )
+                if aclient_openai and hasattr(aclient_openai, "aclose"):
+                    await aclient_openai.aclose()
+                return FunctionResponse(message=Messages({"final_answer": final_answer}), failed=False)
+
+        # If skip_final_answer is true or if we couldn't generate one, return formatted context
+        return FunctionResponse(message=Messages(search_results_dict.get("llm_formatted_context", "No formatted context generated.")), failed=False)
+
+    except Exception as e:
+        print(f"❌ Error during retrieval: {e}")
+        return FunctionResponse(message=Messages({"error": str(e)}),failed=True)
 
 def test_query():
     params = {

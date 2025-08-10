@@ -1,3 +1,5 @@
+from app.retrieval import classify_intent_llm, init_async_openai_client
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
@@ -17,7 +19,6 @@ async def rag_search(request: QueryRequest):
     config = {"index_name": "ragsapp"}
     message = Message(params=params, config=config)
     response: FunctionResponse = await handle_request(message)
-    # Ensure final_answer is a string
     final_answer = ""
     if isinstance(response.message, dict):
         final_answer = response.message.get("final_answer", "")
@@ -26,3 +27,14 @@ async def rag_search(request: QueryRequest):
     else:
         final_answer = str(response.message)
     return {"final_answer": final_answer, "failed": response.failed}
+
+class IntentRequest(BaseModel):
+    question: str
+
+@app.post("/classify-intent")
+async def classify_intent(request: IntentRequest):
+    aclient_openai = await init_async_openai_client()
+    if not aclient_openai:
+        return {"intent": "retrieval"}
+    intent = await classify_intent_llm(request.question, aclient_openai)
+    return {"intent": intent}
