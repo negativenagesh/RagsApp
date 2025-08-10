@@ -20,6 +20,8 @@
   </a>
 </p>
 
+/mcp use OX2pXc0xOM
+
 WhatsApp-first RAG with Elasticsearch Cloud, split into Python microservices:
 
 - Ingestion Service (FastAPI): extracts text from user files, chunks, embeds with OpenAI, and indexes vectors into Elasticsearch dense_vector.
