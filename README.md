@@ -20,31 +20,19 @@
   </a>
 </p>
 
+<div align='center'>
+	<h1>/mcp use 3PIHbeAQSs or https://puch.ai/mcp/3PIHbeAQSs</h1>
+
+ <h2>1. How to query ---> "ask my rag: your query"</h2>
+<h2>2. Puch AI gives timeout while retrieving if user needs in depth answer for his file</h2>
+</div>
+
+
 WhatsApp-first RAG with Elasticsearch Cloud, split into Python microservices:
 
 - Ingestion Service (FastAPI): extracts text from user files, chunks, embeds with OpenAI, and indexes vectors into Elasticsearch dense_vector.
-- Retrieval Service (FastAPI): ANN search in Elasticsearch and LLM answering via OpenAI chat completions.
+- Retrieval Service (FastAPI): search in Elasticsearch and LLM answering via OpenAI chat completions.
 - WhatsApp Webhook Service (FastAPI): receives WhatsApp messages (Whapi.cloud), routes documents to ingestion and text to retrieval, and replies to users.
-
-## Directory layout
-
-```text
-src/
-	common/                # shared utilities
-		config.py            # env-driven settings (ES, OpenAI, WhatsApp)
-		es_client.py         # Elasticsearch client factory
-		embeddings.py        # OpenAI embeddings wrapper
-		chunking.py          # simple text chunking helpers
-	core/base/parsers/     # existing parsers reused by ingestion
-	ingestion_service/
-		app.py               # /ingest file endpoint
-	retrieval_service/
-		app.py               # /search and /answer
-	whatsapp_service/
-		app.py               # /whapi/webhook for Whapi.cloud
-```
-
-Entry point: `main.py` dispatches based on SERVICE env (`ingestion|retrieval|whatsapp`).
 
 ## Configure environment
 
