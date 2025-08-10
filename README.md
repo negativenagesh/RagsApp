@@ -20,7 +20,13 @@
   </a>
 </p>
 
-/mcp use OX2pXc0xOM
+<div align='center'>
+	<h1>/mcp use 3PIHbeAQSs or https://puch.ai/mcp/3PIHbeAQSs</h1>
+
+ 1. How to query -
+    --> "ask my rag: your query"
+</div>
+
 
 WhatsApp-first RAG with Elasticsearch Cloud, split into Python microservices:
 
