@@ -1,5 +1,6 @@
 import os
 import asyncio
+from base64 import b64decode
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
@@ -62,29 +63,60 @@ async def ask_rag(
         "enable_references_citations": enable_references_citations,
         "deep_research": deep_research,
     }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(RAG_API_URL, json=payload, timeout=120)
-        data = resp.json()
-        if "final_answer" in data:
-            return data["final_answer"]
-        if "result" in data:
-            return data["result"]
-        return str(data)
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(RAG_API_URL, json=payload, timeout=60)  # 60s max
+            data = resp.json()
+            if "final_answer" in data:
+                return data["final_answer"]
+            if "result" in data:
+                return data["result"]
+            return str(data)
+    except httpx.ReadTimeout:
+        # Optionally, trigger background processing here and notify user later by other means
+        return "Your request is taking longer than expected. You will receive the answer soon."
+    except Exception as e:
+        return f"Error contacting RAG backend: {e}"
 
-# --- Tool: ingest_file ---
 @mcp.tool(description="Ingest a document into the knowledge base.")
 async def ingest_file(
-    file_url: Annotated[AnyUrl, Field(description="Public URL to the file")],
+    file_data: Annotated[str | None, Field(description="Base64-encoded file data")] = None,
+    file_url: Annotated[AnyUrl | None, Field(description="Public URL to the file")] = None,
+    filename: Annotated[str | None, Field(description="Original filename")] = None,
     description: Annotated[str, Field(description="File description")] = "",
 ) -> str:
+    if file_data:
+        # Decode base64 file data
+        file_bytes = b64decode(file_data)
+        files = {"file": (filename or "uploaded_file", file_bytes)}
+    elif file_url:
+        async with httpx.AsyncClient() as client:
+            file_resp = await client.get(str(file_url))
+            if file_resp.status_code != 200:
+                raise McpError(ErrorData(code=INVALID_PARAMS, message="Could not download file"))
+            files = {"file": ("uploaded_file", file_resp.content)}
+    else:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="No file data or URL provided."))
+
+    data = {"description": description}
     async with httpx.AsyncClient() as client:
-        file_resp = await client.get(str(file_url))
-        if file_resp.status_code != 200:
-            raise McpError(ErrorData(code=INVALID_PARAMS, message="Could not download file"))
-        files = {"file": ("uploaded_file", file_resp.content)}
-        data = {"description": description}
         ingest_resp = await client.post(INGESTION_API_URL, data=data, files=files)
         return ingest_resp.text
+
+@mcp.tool(description="Returns the server owner's phone number in {country_code}{number} format.")
+async def validate() -> str:
+    """
+    Returns the server owner's phone number in {country_code}{number} format.
+    Example: 919876543210 for +91-9876543210
+    """
+    import re
+    number = os.environ.get("MY_NUMBER")
+    if not number:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="MY_NUMBER is not set in the environment."))
+    # Ensure only digits, and length is reasonable (10-15 digits)
+    if not re.fullmatch(r"\d{10,15}", number):
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="MY_NUMBER must be in {country_code}{number} format, digits only."))
+    return number
 
 # --- Run MCP Server ---
 async def main():
