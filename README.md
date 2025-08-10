@@ -21,9 +21,9 @@
 </p>
 
 <div align='center'>
-	<h1>/mcp use 3PIHbeAQSs or https://puch.ai/mcp/3PIHbeAQSs</h1>
-
- <h2>1. How to query ---> "ask my rag: your query"</h2>
+ <h1>RAG in Puch AI</h1>
+ <h2>/mcp use 3PIHbeAQSs or https://puch.ai/mcp/3PIHbeAQSs</h1>
+ <h2>1. How to query ---> "ask my rag: your query" example- ask my rag: Where does Subrahmanya stay in?</h2>
 <h2>2. Puch AI gives timeout while retrieving if user needs in depth answer for his file</h2>
 </div>
 
