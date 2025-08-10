@@ -30,4 +30,4 @@ nltk
 torch
 httpx
 
-vercel-fastapi
+vercel
