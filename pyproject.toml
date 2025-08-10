@@ -5,5 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "fastmcp>=2.11.2",
+    "mcp-cli>=0.6",
     "pymupdf>=1.26.3",
 ]
