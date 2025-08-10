@@ -29,3 +29,5 @@ openpyxl
 nltk
 torch
 httpx
+
+vercel-fastapi
