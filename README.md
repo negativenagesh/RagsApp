@@ -20,13 +20,6 @@
   </a>
 </p>
 
-<div align='center'>
- <h1>RAG in Puch AI</h1>
- <h2>/mcp use 3PIHbeAQSs or https://puch.ai/mcp/3PIHbeAQSs</h1>
- <h2>1. How to query ---> "ask my rag: your query" example- ask my rag: Where does Subrahmanya stay in?</h2>
-<h2>2. Puch AI gives timeout while retrieving if user needs in depth answer for his file</h2>
-</div>
-
 
 WhatsApp-first RAG with Elasticsearch Cloud, split into Python microservices:
 
@@ -52,8 +45,8 @@ Set these variables (e.g., in a `.env` or shell):
 	- WHAPI_TOKEN=<your_whapi_token>
 
 - Service URLs for cross-calls (used by whatsapp service)
-	- INGESTION_URL=http://localhost:8001
-	- RETRIEVAL_URL=http://localhost:8002
+	- INGESTION_URL=http://localhost:8002
+	- RETRIEVAL_URL=http://localhost:8001
 
 ## Run locally
 
