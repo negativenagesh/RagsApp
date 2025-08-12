@@ -13,6 +13,7 @@ import json
 import shutil
 import random
 import sys
+import filetype
 
 import pdfplumber
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -24,6 +25,12 @@ from parsers.pdf_parser import PDFParser
 from parsers.ocr_parser import OCRParser
 from parsers.csv_parser import CSVParser
 from parsers.xlsx_parser import XLSXParser
+from parsers.img_parser import ImageParser
+from parsers.text_parser import TextParser
+from parsers.docx_parser import DOCXParser
+from parsers.odt_parser import ODTParser
+from parsers.doc_parser import DOCParser
+
 from .es_client import ensure_es_index_exists
 from .es_client import CHUNKED_PDF_MAPPINGS
 
@@ -653,6 +660,234 @@ class IngestionProcessor:
         
         print(f"Finished processing for '{file_name}'. Successfully processed and yielded {num_successfully_processed}/{len(all_raw_chunks_with_meta)} chunks.")
 
+    async def process_doc(
+        self, data: bytes, file_name: str, doc_id: str, user_provided_document_summary: str
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        print(f"Processing DOC: {file_name} (Doc ID: {doc_id})")
+    
+        parser = DOCParser(self.aclient_openai,self.Server_type,self)
+        full_document_text = ""
+        try:
+            # The DOCParser's ingest method is an async generator. We consume it fully
+            # to get all paragraphs and then join them to form the complete document text.
+            all_parts = [p async for p in parser.ingest(data)]
+            full_document_text = " ".join(all_parts)
+            print(f"Successfully parsed .doc file '{file_name}'. Total length: {len(full_document_text)} characters.")
+        except Exception as e:
+            print(f"Failed to parse .doc file '{file_name}': {e}")
+            return
+
+        if not full_document_text.strip():
+            print(f"No text extracted from DOC file '{file_name}'. Aborting processing.")
+            return
+
+        llm_generated_doc_summary = await self._generate_document_summary(full_document_text)
+        
+        all_raw_chunks_with_meta = await self._generate_all_raw_chunks_from_doc(
+            full_document_text, file_name, doc_id
+        )
+
+        if not all_raw_chunks_with_meta:
+            print(f"No raw chunks were generated from DOC file '{file_name}'. Aborting further processing.")
+            return
+
+        all_raw_texts = [chunk["text"] for chunk in all_raw_chunks_with_meta]
+        
+        print(f"Starting concurrent processing for {len(all_raw_chunks_with_meta)} raw chunks from DOC file '{file_name}'.")
+
+        processing_tasks = []
+        for i, raw_chunk_info_item in enumerate(all_raw_chunks_with_meta):
+            task = asyncio.create_task(
+                self._process_individual_chunk_pipeline(
+                    raw_chunk_info=raw_chunk_info_item,
+                    user_provided_doc_summary=user_provided_document_summary, 
+                    llm_generated_doc_summary=llm_generated_doc_summary, 
+                    all_raw_texts=all_raw_texts,
+                    global_idx=i, file_name=file_name, doc_id=doc_id,
+                    params=self.params        
+                )
+            )
+            processing_tasks.append(task)
+        
+        num_successfully_processed = 0
+        for future in asyncio.as_completed(processing_tasks):
+            try:
+                es_action = await future 
+                if es_action: 
+                    yield es_action
+                    num_successfully_processed += 1
+            except Exception as e:
+                print(f"Error processing a chunk future for DOC file '{file_name}': {e}")
+        
+        print(f"Finished processing for DOC file '{file_name}'. Successfully processed and yielded {num_successfully_processed}/{len(all_raw_chunks_with_meta)} chunks.")
+     
+    async def process_docx(
+        self, data: bytes, file_name: str, doc_id: str, user_provided_document_summary: str
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        print(f"Processing DOCX: {file_name} (Doc ID: {doc_id})")
+    
+        parser = DOCXParser(self.aclient_openai,self.Server_type,self)
+        
+        full_document_text = ""
+        try:
+            all_parts = [p async for p in parser.ingest(data)]
+            full_document_text = " ".join(all_parts)
+            print(f"Successfully parsed .docx file '{file_name}'. Total length: {len(full_document_text)} characters.")
+        except Exception as e:
+            print(f"Failed to parse .docx file '{file_name}': {e}")
+            return
+
+        if not full_document_text.strip():
+            print(f"No text extracted from DOCX file '{file_name}'. Aborting processing.")
+            return
+
+        llm_generated_doc_summary = await self._generate_document_summary(full_document_text)
+        
+        all_raw_chunks_with_meta = await self._generate_all_raw_chunks_from_doc(
+            full_document_text, file_name, doc_id
+        )
+
+        if not all_raw_chunks_with_meta:
+            print(f"No raw chunks were generated from DOCX file '{file_name}'. Aborting further processing.")
+            return
+
+        all_raw_texts = [chunk["text"] for chunk in all_raw_chunks_with_meta]
+        
+        print(f"Starting concurrent processing for {len(all_raw_chunks_with_meta)} raw chunks from DOCX file '{file_name}'.")
+
+        processing_tasks = []
+        for i, raw_chunk_info_item in enumerate(all_raw_chunks_with_meta):
+            task = asyncio.create_task(
+                self._process_individual_chunk_pipeline(
+                    raw_chunk_info=raw_chunk_info_item,
+                    user_provided_doc_summary=user_provided_document_summary, 
+                    llm_generated_doc_summary=llm_generated_doc_summary, 
+                    all_raw_texts=all_raw_texts,
+                    global_idx=i, file_name=file_name, doc_id=doc_id,
+                    params=self.params        
+                )
+            )
+            processing_tasks.append(task)
+        
+        num_successfully_processed = 0
+        for future in asyncio.as_completed(processing_tasks):
+            try:
+                es_action = await future 
+                if es_action: 
+                    yield es_action
+                    num_successfully_processed += 1
+            except Exception as e:
+                print(f"Error processing a chunk future for DOCX file '{file_name}': {e}")
+        
+        print(f"Finished processing for DOCX file '{file_name}'. Successfully processed and yielded {num_successfully_processed}/{len(all_raw_chunks_with_meta)} chunks.")
+
+    async def process_odt(
+        self, data: bytes, file_name: str, doc_id: str, user_provided_document_summary: str
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        print(f"Processing ODT: {file_name} (Doc ID: {doc_id})")
+
+        parser = ODTParser(self.aclient_openai, self.Server_type, self)
+
+        full_document_text = ""
+        try:
+            all_parts = [p async for p in parser.ingest(data)]
+            full_document_text = " ".join(all_parts)
+            print(f"Successfully parsed .odt file '{file_name}'. Total length: {len(full_document_text)} characters.")
+        except Exception as e:
+            print(f"Failed to parse .odt file '{file_name}': {e}")
+            return
+
+        if not full_document_text.strip():
+            print(f"No content extracted from ODT file '{file_name}'. Aborting processing.")
+            return
+
+        llm_generated_doc_summary = await self._generate_document_summary(full_document_text)
+
+        all_raw_chunks_with_meta = await self._generate_all_raw_chunks_from_doc(
+            full_document_text, file_name, doc_id
+        )
+
+        if not all_raw_chunks_with_meta:
+            return
+
+        all_raw_texts = [chunk["text"] for chunk in all_raw_chunks_with_meta]
+
+        processing_tasks = []
+        for i, raw_chunk_info_item in enumerate(all_raw_chunks_with_meta):
+            task = asyncio.create_task(
+                self._process_individual_chunk_pipeline(
+                    raw_chunk_info=raw_chunk_info_item,
+                    user_provided_doc_summary=user_provided_document_summary,
+                    llm_generated_doc_summary=llm_generated_doc_summary,
+                    all_raw_texts=all_raw_texts,
+                    global_idx=i, file_name=file_name, doc_id=doc_id,
+                    params=self.params
+                )
+            )
+            processing_tasks.append(task)
+
+        for future in asyncio.as_completed(processing_tasks):
+            es_action = await future
+            if es_action:
+                yield es_action
+    
+    async def process_txt(
+        self, data: bytes, file_name: str, doc_id: str, user_provided_document_summary: str
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        print(f"Processing TXT: {file_name} (Doc ID: {doc_id})")
+        try:
+            txt_parser = TextParser()
+            full_document_text_parts = [text_part async for text_part in txt_parser.ingest(data)]
+            full_document_text = " ".join(filter(None, full_document_text_parts))
+
+            if not full_document_text.strip():
+                print(f"No text extracted from '{file_name}'. Aborting processing.")
+                return
+
+            llm_generated_doc_summary = await self._generate_document_summary(full_document_text)
+
+            all_raw_chunks_with_meta = await self._generate_all_raw_chunks_from_doc(
+                full_document_text, file_name, doc_id
+            )
+
+            if not all_raw_chunks_with_meta:
+                print(f"No raw chunks were generated from '{file_name}'. Aborting.")
+                return
+
+            all_raw_texts = [chunk["text"] for chunk in all_raw_chunks_with_meta]
+            print(f"Starting concurrent processing for {len(all_raw_chunks_with_meta)} raw chunks from '{file_name}'.")
+
+            processing_tasks = []
+            for i, raw_chunk_info_item in enumerate(all_raw_chunks_with_meta):
+                task = asyncio.create_task(
+                    self._process_individual_chunk_pipeline(
+                        raw_chunk_info=raw_chunk_info_item,
+                        user_provided_doc_summary=user_provided_document_summary,
+                        llm_generated_doc_summary=llm_generated_doc_summary,
+                        all_raw_texts=all_raw_texts,
+                        global_idx=i,
+                        file_name=file_name,
+                        doc_id=doc_id,
+                        params=self.params
+                    )
+                )
+                processing_tasks.append(task)
+
+            num_successfully_processed = 0
+            for future in asyncio.as_completed(processing_tasks):
+                try:
+                    es_action = await future
+                    if es_action:
+                        yield es_action
+                        num_successfully_processed += 1
+                except Exception as e:
+                    print(f"Error processing a chunk future for '{file_name}': {e}")
+
+            print(f"Finished processing for '{file_name}'. Successfully processed and yielded {num_successfully_processed}/{len(all_raw_chunks_with_meta)} chunks.")
+
+        except Exception as e:
+            print(f"Major failure in process_txt for '{file_name}': {e}")
+    
     async def process_csv_semantic_chunking(
         self, data: bytes, file_name: str, doc_id: str, user_provided_document_summary: str
     ) -> AsyncGenerator[Dict[str, Any], None]:
@@ -922,8 +1157,6 @@ class IngestionProcessor:
         
         return min(rows_per_chunk, 1)
 
-# --- Main Orchestration Function ---
-
 async def process_and_ingest_file(
     file_data: bytes,
     original_file_name: str,
@@ -931,7 +1164,8 @@ async def process_and_ingest_file(
     es_client: Any,
     aclient_openai: Any,
     params: Any,
-    user_provided_doc_summary: str = ""
+    user_provided_doc_summary: str = "",
+    mime_type: str = None
 ):
     """
     High-level function to run the full ingestion pipeline for a single file.
@@ -944,6 +1178,68 @@ async def process_and_ingest_file(
     file_extension = os.path.splitext(original_file_name)[1].lower()
     params = {"index_name": index_name, "file_name": original_file_name}
     config = {}
+    
+    file_extension = os.path.splitext(original_file_name)[1].lower()
+    if not file_extension or file_extension == "":
+        kind = filetype.guess(file_data)
+        if kind and kind.mime.startswith("image/"):
+            file_extension = "." + kind.extension
+            print(f"Guessed image extension: {file_extension}")
+        elif mime_type and mime_type.startswith("image/"):
+            file_extension = "." + mime_type.split("/")[-1]
+            print(f"Guessed image extension from mime_type: {file_extension}")
+
+    
+    image_extensions = [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"]
+    if file_extension in image_extensions:
+        print(f"Processing image file: {original_file_name}")
+        parser = ImageParser(aclient_openai)
+        description = ""
+        async for desc in parser.ingest(file_data, filename=original_file_name):
+            description = desc
+            break  # Only one result expected
+
+        if not description:
+            return {"status": "error", "message": "Failed to process image with vision model."}
+
+        # Use the vision output as both the chunk and the summary
+        chunk_text = description
+        doc_summary = description
+
+        # Generate embedding for the description
+        embedding_list = await IngestionProcessor(params, config, aclient_openai, file_extension)._generate_embeddings([chunk_text])
+        embedding_vector = embedding_list[0] if embedding_list and embedding_list[0] else []
+
+        if not embedding_vector:
+            return {"status": "error", "message": "Failed to generate embedding for image description."}
+
+        es_doc_id = f"{document_id}_img"
+        metadata_payload = {
+            "file_name": original_file_name,
+            "doc_id": document_id,
+            "page_number": 1,
+            "chunk_index_in_page": 0,
+            "document_summary": doc_summary,
+            "entities": [],
+            "relationships": [],
+            "image_file": True
+        }
+        action = {
+            "_index": index_name,
+            "_id": es_doc_id,
+            "_source": {
+                "chunk_text": chunk_text,
+                "embedding": embedding_vector,
+                "metadata": metadata_payload
+            }
+        }
+        try:
+            successes, response = await async_bulk(es_client, [action], raise_on_error=False)
+            print(f"Elasticsearch image ingestion: {successes} successes.")
+            return {"status": "success", "message": "Image ingestion complete.", "num_chunks": 1}
+        except Exception as e:
+            print(f"Error indexing image: {e}")
+            return {"status": "error", "message": f"Failed to index image: {e}"}
 
     processor = IngestionProcessor(params, config, aclient_openai, file_extension)
     actions_for_es = []
@@ -956,6 +1252,14 @@ async def process_and_ingest_file(
             doc_iterator = processor.process_csv_semantic_chunking(file_data, original_file_name, document_id, user_provided_doc_summary)
         elif file_extension == ".xlsx":
             doc_iterator = processor.process_xlsx_semantic_chunking(file_data, original_file_name, document_id, user_provided_doc_summary)
+        elif file_extension == ".doc":
+            doc_iterator = processor.process_doc(file_data, original_file_name, document_id, user_provided_doc_summary)
+        elif file_extension == ".docx":
+            doc_iterator = processor.process_docx(file_data, original_file_name, document_id, user_provided_doc_summary)
+        elif file_extension == ".odt":
+            doc_iterator = processor.process_odt(file_data, original_file_name, document_id, user_provided_doc_summary)
+        elif file_extension == ".txt":
+            doc_iterator = processor.process_txt(file_data, original_file_name, document_id, user_provided_doc_summary)
         else:
             print(f"Unsupported file type: '{file_extension}'. Only .pdf, .csv and .xlsx are supported.")
             return {"status": "error", "message": "Unsupported file type."}
