@@ -34,7 +34,7 @@ async def send_whatsapp_message(to: str, text: str):
         "text": {"body": text}
     }
     async with httpx.AsyncClient() as client:
-        wa_resp = await client.post(whatsapp_url, headers=headers, json=wa_payload)
+        wa_resp = await client.post(whatsapp_url, headers=headers, json=wa_payload,)
         if wa_resp.status_code not in (200, 201):
             print(f"Failed to send WhatsApp message: {wa_resp.text}")
 
@@ -61,7 +61,7 @@ def split_message(text, max_length=4096):
 async def get_intent(question: str) -> str:
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(RAG_INTENT_URL, json={"question": question}, timeout=30)
+            resp = await client.post(RAG_INTENT_URL, json={"question": question}, timeout=300)
             data = resp.json()
             return data.get("intent", "retrieval")
     except Exception as e:
@@ -133,12 +133,31 @@ async def whatsapp_webhook(request: Request):
                 media_info = message[media_type]
                 media_id = media_info["id"]
                 filename = media_info.get("filename", f"uploaded_{media_type}")
+                
                 from app.whatsapp_api import download_media
                 file_bytes = await download_media(media_id)
-                await ingest_file(filename, file_bytes)
-                reply = f"✅ File '{filename}' received and processed. You can now ask questions about its content!"
+                
+                # 1. Notify user that processing has started
+                await send_whatsapp_message(from_number, f"⏳ Processing the file: {filename}")
+                
+                try:
+                    # This waits for the ingestion service to finish
+                    await ingest_file(filename, file_bytes)
+                    
+                    # 2. If successful, send the completion message
+                    reply = f"✅ Success! You can now ask questions about the content of '{filename}'."
+                
+                except Exception as e:
+                    # 3. If an error occurs, send a failure message
+                    print(f"Error during file ingestion: {e}")
+                    reply = (
+                        f"❌ Sorry, there was an error processing '{filename}'. "
+                        "Please try uploading it again."
+                    )
+                
+                # Send the final reply (either success or failure)
                 await send_whatsapp_message(from_number, reply)
-                return {"status": "file ingested"}
+                return {"status": "file processing finished"}
 
         # Ignore all other message types (including status updates)
         return {"status": "ignored"}
