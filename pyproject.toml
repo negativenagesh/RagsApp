@@ -5,7 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "document>=1.0",
     "fastmcp>=2.11.2",
+    "filetype>=1.2.0",
     "mcp-cli>=0.6",
+    "odfdo>=3.16.1",
+    "odfpy>=1.4.1",
+    "olefile>=0.47",
     "pymupdf>=1.26.3",
+    "python-docx>=1.2.0",
 ]
