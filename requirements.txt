@@ -31,3 +31,8 @@ torch
 httpx
 
 vercel
+
+olefile
+Document
+python-docx
+odfpy
