@@ -45,8 +45,8 @@ Set these variables (e.g., in a `.env` or shell):
 	- WHAPI_TOKEN=<your_whapi_token>
 
 - Service URLs for cross-calls (used by whatsapp service)
-	- INGESTION_URL=http://localhost:8001
-	- RETRIEVAL_URL=http://localhost:8002
+	- INGESTION_URL=http://localhost:8002
+	- RETRIEVAL_URL=http://localhost:8001
 
 ## Run locally
 
