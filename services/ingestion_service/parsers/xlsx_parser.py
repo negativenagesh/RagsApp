@@ -1,16 +1,12 @@
 import logging
 from io import BytesIO
 from typing import AsyncGenerator,List
-
 import networkx as nx
 import numpy as np
 import openpyxl
-
 from .base_parser import AsyncParser
 
 logger = logging.getLogger(__name__)
-
-
 class XLSXParser(AsyncParser[bytes]):
     """A parser for XLSX data that yields each row as a list of cell values."""
 
@@ -59,7 +55,7 @@ class XLSXParserAdvanced(AsyncParser[bytes]):
             min_col, max_col = min(cols), max(cols)
             yield arr[min_row : max_row + 1, min_col : max_col + 1].astype(str)
 
-    async def ingest(self, data: bytes, **kwargs) -> AsyncGenerator[str, None]:
+    async def ingest(self, data: bytes, **kwargs) -> AsyncGenerator[List[str], None]:
         """Ingest XLSX data and yield text from each identified data table."""
         if not isinstance(data, bytes):
             raise TypeError("XLSX data must be in bytes format.")
