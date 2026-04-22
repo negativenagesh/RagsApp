@@ -1,0 +1,44 @@
+services:
+  rag_service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ragsapp-rag
+    working_dir: /workspace/services/rag_service
+    command: uv run --active --no-project uvicorn app.main:app --host 0.0.0.0 --port 8001
+    env_file:
+      - ./.env
+    ports:
+      - "8001:8001"
+
+  ingestion_service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ragsapp-ingestion
+    working_dir: /workspace/services/ingestion_service
+    command: uv run --active --no-project uvicorn app.main:app --host 0.0.0.0 --port 8002
+    env_file:
+      - ./.env
+    ports:
+      - "8002:8002"
+
+  whatsapp_gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ragsapp-whatsapp
+    working_dir: /workspace/services/whatsapp_gateway
+    command: uv run --active --no-project uvicorn app.main:app --host 0.0.0.0 --port 8003
+    env_file:
+      - ./.env
+      - ./services/whatsapp_gateway/.env
+    environment:
+      INGESTION_API_URL: http://ingestion_service:8002/ingest
+      RAG_API_URL: http://rag_service:8001/rag-search
+      RAG_STREAM_API_URL: http://rag_service:8001/rag-search/stream
+    depends_on:
+      - ingestion_service
+      - rag_service
+    ports:
+      - "8003:8003"

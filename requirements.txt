@@ -29,6 +29,7 @@ openpyxl
 nltk
 torch
 httpx
+duckduckgo-search
 
 vercel
 
