@@ -1,7 +1,15 @@
+# base/parsers/ocr_parser.py
+"""
+OCR Parser module for OCR-based text extraction from PDF files.
+Uses pdf2image and pytesseract for offline OCR processing.
+"""
 import asyncio
 from io import BytesIO
 from typing import AsyncGenerator
 
+from .ocr_utils import clean_ocr_repetitions
+
+# Optional dependency checks
 try:
     from pdf2image import convert_from_bytes
     PYPDF2IMAGE_INSTALLED = True
@@ -14,15 +22,13 @@ try:
 except ImportError:
     PYTESSERACT_INSTALLED = False
 
+
 class OCRParser:
     """A parser for OCR-based text extraction from PDF files."""
 
     def __init__(self):
         if not PYPDF2IMAGE_INSTALLED or not PYTESSERACT_INSTALLED:
-            msg = (
-                "OCR parsing requires 'pdf2image' and 'pytesseract'. "
-                "Please install them and ensure Tesseract-OCR is in your system's PATH."
-            )
+            msg = "OCR parsing requires 'pdf2image' and 'pytesseract'. Please install them and ensure Tesseract-OCR is in your system's PATH."
             print(f"ERROR: {msg}")
             raise ImportError(msg)
 
@@ -39,11 +45,12 @@ class OCRParser:
             for i, image in enumerate(images):
                 page_num = i + 1
                 try:
-                    # Run OCR in a thread to avoid blocking the event loop
                     page_text = await asyncio.to_thread(pytesseract.image_to_string, image)
                     if not page_text or not page_text.strip():
                         print(f"OCR found no text on page {page_num}.")
-                    yield page_text
+                    # Clean OCR repetitions before yielding
+                    cleaned_text = clean_ocr_repetitions(page_text)
+                    yield cleaned_text
                 except pytesseract.TesseractNotFoundError:
                     print("Tesseract executable not found. Please install Tesseract-OCR and ensure it's in your system's PATH.")
                     raise

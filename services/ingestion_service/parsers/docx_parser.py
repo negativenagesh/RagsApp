@@ -1,13 +1,8 @@
-# src/core/base/parsers/docx_parser.py
-import os
-import logging
 from io import BytesIO
 from typing import AsyncGenerator,Optional,Any
 import base64
 import yaml
 from pathlib import Path
-from dotenv import load_dotenv
-
 from .base_parser import AsyncParser
 from openai import AsyncOpenAI
 
@@ -23,21 +18,18 @@ try:
 except ImportError:
     PYTHON_DOCX_INSTALLED = False
 
-load_dotenv()
-
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_MODEL" ,"gpt-4o-mini")
+OPENAI_CHAT_MODEL = "gpt-4o-mini"
 
 class DOCXParser(AsyncParser[bytes]):
     """A parser for DOCX data, including text, tables, and image descriptions."""
 
-    def __init__(self, aclient_openai: Optional[AsyncOpenAI], server_type: str, processor_ref: Optional[Any] = None):
+    def __init__(self, aclient_openai: Optional[AsyncOpenAI], processor_ref: Optional[Any] = None):
         if not PYTHON_DOCX_INSTALLED:
             msg = "DOCX parsing requires 'python-docx'. Please install it (`pip install python-docx`)."
             print(msg)
             raise ImportError(msg)
             
         self.aclient_openai = aclient_openai
-        self.server_type = server_type
         self.processor_ref = processor_ref
         self.vision_prompt_text = self._load_vision_prompt()
     
@@ -59,33 +51,38 @@ class DOCXParser(AsyncParser[bytes]):
             print(f"Error loading vision prompt: {e}")
             return "Describe the image in detail."
     
-    async def _get_image_description(self, image_bytes: bytes, content_type:str) -> str:
-        """Generates a description for an image using either OpenAI or a referenced processor for ARMY mode."""
+    async def _get_image_description(self, image_bytes: bytes, content_type: str) -> str:
+        """
+        Generates a description for an image using OpenAI.
+        Only generates descriptions for images larger than 100x100 pixels.
+        """
+        # Check image dimensions before processing
+        try:
+            from PIL import Image
+            from io import BytesIO
+            
+            img = Image.open(BytesIO(image_bytes))
+            width, height = img.size
+
+            # Skip small images (less than 1x1 pixels)
+            if width < 1 or height < 1:
+                print(f"Skipping small image description (dimensions: {width}x{height})")
+                return ""
+                
+            print(f"Processing image with dimensions: {width}x{height}")
+        except Exception as e:
+            print(f"Error checking image dimensions: {e}. Will attempt to process anyway.")
+            # Continue with description generation despite dimension check failure
+        
         image_data = base64.b64encode(image_bytes).decode("utf-8")
         media_type = content_type
 
-
-        # Route to NVIDIA API via processor_ref for ARMY mode
-        if self.server_type == "ARMY":
-            if not self.processor_ref:
-                print("Processor reference not available for NVIDIA VLM call. Skipping image description.")
-                return ""
-            
-            print("Using NVIDIA VLM for image description.")
-            messages = [{"role": "user", "content": self.vision_prompt_text, "image": image_data}]
-            
-            description = await self.processor_ref._call_nvidia_api(
-                payload_messages=messages, is_vision_call=True, max_tokens=1024
-            )
-            return f"\n[Image Description]: {description.strip()}\n" if description else ""
-
-        # Default to OpenAI for development mode
         if not self.aclient_openai:
             print("OpenAI client not available, skipping image description.")
             return ""
         
         try:
-            print("Using OpenAI Vision for image description.")
+            print("Using GPT-4o for smart image extraction.")
             messages = [{
                 "role": "user",
                 "content": [
@@ -94,14 +91,15 @@ class DOCXParser(AsyncParser[bytes]):
                 ],
             }]
             response = await self.aclient_openai.chat.completions.create(
-                model= "gpt-4o-mini", # Using the chat model defined in ingestion_8.py
+                model=OPENAI_CHAT_MODEL,
                 messages=messages,
-                max_tokens=1024,
+                max_tokens=4096,
+                temperature=0.3,
             )
             description = response.choices[0].message.content
-            return f"\n[Image Description]: {description.strip()}\n" if description else ""
+            return f"\n{description.strip()}\n" if description else ""
         except Exception as e:
-            print(f"Error getting image description from OpenAI: {e}")
+            print(f"Error getting image extraction from OpenAI: {e}")
             return ""
 
     def _convert_table_to_markdown(self, table: Table) -> str:
@@ -129,10 +127,50 @@ class DOCXParser(AsyncParser[bytes]):
             
         return "\n".join(markdown_rows)
 
+    async def _process_paragraph_with_precise_ordering(self, para: Paragraph, image_parts: dict) -> AsyncGenerator[str, None]:
+        """
+        Process paragraph content with parallel image processing.
+        Collects all images in the paragraph and processes them concurrently.
+        """
+        # Check if paragraph has any content
+        if not para.text.strip() and not any(run._r.xpath(".//a:blip/@r:embed") for run in para.runs):
+            return
+        
+        # Yield paragraph text first (if it exists)
+        if para.text.strip():
+            yield para.text.strip()
+        
+        # Collect all image tasks from all runs in this paragraph
+        import asyncio
+        image_tasks = []
+        for run in para.runs:
+            image_refs = run._r.xpath(".//a:blip/@r:embed")
+            for rId in image_refs:
+                if rId in image_parts:
+                    image_part = image_parts[rId]
+                    image_tasks.append(self._get_image_description(image_part.blob, image_part.content_type))
+        
+        if image_tasks:
+            print(f"Processing {len(image_tasks)} images in paragraph in parallel...")
+            image_results = await asyncio.gather(*image_tasks, return_exceptions=True)
+            for result in image_results:
+                if isinstance(result, Exception):
+                    print(f"Image extraction failed: {result}")
+                elif result:
+                    yield result
+
     async def ingest(self, data: bytes, **kwargs) -> AsyncGenerator[str, None]:
-        """Ingest DOCX data, yielding paragraphs and tables as strings in their original document order."""
+        """Ingest DOCX data, yielding paragraphs and tables as strings in their original document order.
+        Also saves extracted images to the specified directory."""
         if not isinstance(data, bytes):
             raise TypeError("DOCX data must be in bytes format.")
+
+        # Import PIL here to ensure it's available
+        try:
+            from PIL import Image
+        except ImportError:
+            print("Warning: PIL/Pillow not installed. Image dimension filtering will be skipped.")
+            print("Install with: pip install Pillow")
 
         docx_stream = BytesIO(data)
         try:
@@ -149,21 +187,11 @@ class DOCXParser(AsyncParser[bytes]):
             for block in document.element.body:
                 if isinstance(block, CT_P):
                     para = Paragraph(block, document)
-                    if para.text.strip():
-                        yield para.text.strip()
                     
-                    # Check for images within the paragraph's XML
-                    for rId in para._p.xpath(".//a:blip/@r:embed"):
-                        if rId in image_parts:
-                            image_part = image_parts[rId]
-                            image_bytes = image_part.blob
-                            image_content_type = image_part.content_type
-                            print(f"Found image '{image_part.partname}' ({image_content_type}). Generating description.")
-                            
-                            description = await self._get_image_description(image_bytes, image_content_type)
-                            if description:
-                                yield description
-                    
+                    # NEW: Use the precise ordering method instead of the old approach
+                    async for content_item in self._process_paragraph_with_precise_ordering(para, image_parts):
+                        yield content_item
+                
                 elif isinstance(block, CT_Tbl):
                     table = Table(block, document)
                     markdown_table = self._convert_table_to_markdown(table)
@@ -171,7 +199,7 @@ class DOCXParser(AsyncParser[bytes]):
                         yield markdown_table
 
         except Exception as e:
-            print(f"Failed to read DOCX stream: {e}", exc_info=True)
+            print(f"Failed to read DOCX stream: {e}")
             raise ValueError(f"Error processing DOCX file: {str(e)}") from e
         finally:
             docx_stream.close()
