@@ -15,7 +15,7 @@ class DOCParser(AsyncParser[bytes]):
     A parser for DOC (legacy Microsoft Word) data, including text and images.
     """
 
-    def __init__(self, aclient_openai: Optional[AsyncOpenAI], server_type: str, processor_ref: Optional[Any] = None):
+    def __init__(self, aclient_openai: Optional[AsyncOpenAI], processor_ref: Optional[Any] = None):
         self.olefile = olefile
         self.aclient_openai = aclient_openai
         self.processor_ref = processor_ref

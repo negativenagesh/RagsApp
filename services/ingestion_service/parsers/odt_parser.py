@@ -28,14 +28,13 @@ OPENAI_CHAT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 class ODTParser(AsyncParser[bytes]):
     """A parser for ODT data, including text, tables, and image descriptions."""
 
-    def __init__(self, aclient_openai: Optional[AsyncOpenAI], server_type: str, processor_ref: Optional[Any] = None):
+    def __init__(self, aclient_openai: Optional[AsyncOpenAI], processor_ref: Optional[Any] = None):
         if not ODFPY_INSTALLED:
             msg = "ODT parsing requires 'odfpy'. Please install it (`pip install odfpy`)."
             logger.error(msg)
             raise ImportError(msg)
             
         self.aclient_openai = aclient_openai
-        self.server_type = server_type
         self.processor_ref = processor_ref
         self.vision_prompt_text = self._load_vision_prompt()
     

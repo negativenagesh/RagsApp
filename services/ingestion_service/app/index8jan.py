@@ -700,7 +700,7 @@ class ChunkingEmbeddingPDFProcessor:
     ) -> AsyncGenerator[Dict[str, Any], None]:
         print(f"Processing DOC: {file_name} (Doc ID: {doc_id})")
     
-        parser = DOCParser(self.aclient_openai,self.Server_type,self)
+        parser = DOCParser(self.aclient_openai, self)
         
         full_document_text = ""
         page_breaks = []
@@ -774,7 +774,7 @@ class ChunkingEmbeddingPDFProcessor:
     ) -> AsyncGenerator[Dict[str, Any], None]:
         print(f"Processing DOCX: {file_name} (Doc ID: {doc_id})")
 
-        parser = DOCXParser(self.aclient_openai, self.Server_type, self)
+        parser = DOCXParser(self.aclient_openai, self)
         
         try:
             all_parts = [part async for part in parser.ingest(data)]
@@ -858,7 +858,7 @@ class ChunkingEmbeddingPDFProcessor:
     ) -> AsyncGenerator[Dict[str, Any], None]:
         print(f"Processing ODT: {file_name} (Doc ID: {doc_id})")
 
-        parser = ODTParser(self.aclient_openai, self.Server_type, self)
+        parser = ODTParser(self.aclient_openai, self)
 
         full_document_text = ""
         try:

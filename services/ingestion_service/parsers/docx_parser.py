@@ -23,14 +23,13 @@ OPENAI_CHAT_MODEL = "gpt-4o-mini"
 class DOCXParser(AsyncParser[bytes]):
     """A parser for DOCX data, including text, tables, and image descriptions."""
 
-    def __init__(self, aclient_openai: Optional[AsyncOpenAI], server_type: str, processor_ref: Optional[Any] = None):
+    def __init__(self, aclient_openai: Optional[AsyncOpenAI], processor_ref: Optional[Any] = None):
         if not PYTHON_DOCX_INSTALLED:
             msg = "DOCX parsing requires 'python-docx'. Please install it (`pip install python-docx`)."
             print(msg)
             raise ImportError(msg)
             
         self.aclient_openai = aclient_openai
-        self.server_type = server_type
         self.processor_ref = processor_ref
         self.vision_prompt_text = self._load_vision_prompt()
     
