@@ -73,19 +73,6 @@ class ODTParser(AsyncParser[bytes]):
         image_data = base64.b64encode(image_bytes).decode("utf-8")
         media_type = content_type
 
-        # if self.server_type == "ARMY":
-        #     if not self.processor_ref:
-        #         logger.warning("Processor reference not available for NVIDIA VLM call. Skipping image description.")
-        #         return ""
-            
-        #     logger.info(f"Using NVIDIA VLM for image ({media_type}).")
-        #     messages = [{"role": "user", "content": self.vision_prompt_text, "image": image_data}]
-            
-        #     description = await self.processor_ref._call_nvidia_api(
-        #         payload_messages=messages, is_vision_call=True, max_tokens=1024
-        #     )
-        #     return f"\n[Image Description]: {description.strip()}\n" if description else ""
-
         if not self.aclient_openai:
             logger.warning("OpenAI client not available, skipping image description.")
             return ""
@@ -190,7 +177,7 @@ class ODTParser(AsyncParser[bytes]):
                         yield markdown_table
 
         except Exception as e:
-            logger.error(f"Failed to read ODT stream: {e}", exc_info=True)
+            print(f"Failed to read ODT stream: {e}")
             raise ValueError(f"Error processing ODT file: {str(e)}") from e
         finally:
             odt_stream.close()

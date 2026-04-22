@@ -1,20 +1,14 @@
-import os
 import re
 import base64
 import yaml
 from io import BytesIO
 from typing import AsyncGenerator, Optional, Any
 from pathlib import Path
-from dotenv import load_dotenv
-
 import olefile
-import logging
 from .base_parser import AsyncParser
 from openai import AsyncOpenAI
 
-load_dotenv()
-
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_CHAT_MODEL = "gpt-4o-mini"
 
 class DOCParser(AsyncParser[bytes]):
     """
@@ -24,7 +18,6 @@ class DOCParser(AsyncParser[bytes]):
     def __init__(self, aclient_openai: Optional[AsyncOpenAI], server_type: str, processor_ref: Optional[Any] = None):
         self.olefile = olefile
         self.aclient_openai = aclient_openai
-        self.server_type = server_type
         self.processor_ref = processor_ref
         self.vision_prompt_text = self._load_vision_prompt()
     
@@ -45,30 +38,19 @@ class DOCParser(AsyncParser[bytes]):
             print(f"Error loading vision prompt: {e}")
             return "Describe the image in detail."
     
+
+
     async def _get_image_description(self, image_bytes: bytes, content_type: str) -> str:
         """Generates a description for an image using its specific content type."""
         image_data = base64.b64encode(image_bytes).decode("utf-8")
         media_type = content_type
-
-        if self.server_type == "ARMY":
-            if not self.processor_ref:
-                print("Processor reference not available for NVIDIA VLM call. Skipping image description.")
-                return ""
-            
-            print(f"Using NVIDIA VLM for image ({media_type}).")
-            messages = [{"role": "user", "content": self.vision_prompt_text, "image": image_data}]
-            
-            description = await self.processor_ref._call_nvidia_api(
-                payload_messages=messages, is_vision_call=True, max_tokens=1024
-            )
-            return f"\n[Image Description]: {description.strip()}\n" if description else ""
 
         if not self.aclient_openai:
             print("OpenAI client not available, skipping image description.")
             return ""
         
         try:
-            print(f"Using OpenAI Vision for image ({media_type}).")
+            print(f"Using GPT-4o for smart image extraction ({media_type}).")
             messages = [{
                 "role": "user",
                 "content": [
@@ -79,12 +61,13 @@ class DOCParser(AsyncParser[bytes]):
             response = await self.aclient_openai.chat.completions.create(
                 model=OPENAI_CHAT_MODEL,
                 messages=messages,
-                max_tokens=1024,
+                max_tokens=4096,
+                temperature=0.3,
             )
             description = response.choices[0].message.content
-            return f"\n[Image Description]: {description.strip()}\n" if description else ""
+            return f"\n{description.strip()}\n" if description else ""
         except Exception as e:
-            print(f"Error getting image description from OpenAI: {e}")
+            print(f"Error getting image extraction from OpenAI: {e}")
             return ""
     
     def _get_content_type_from_bytes(self, image_bytes: bytes) -> Optional[str]:
@@ -121,32 +104,34 @@ class DOCParser(AsyncParser[bytes]):
                     if paragraph.strip():
                         yield paragraph.strip()
             
-            # --- Image Extraction ---
             print("Scanning DOC file for image streams.")
-            image_count = 0
-            # <-- MODIFIED: Iterate through all streams to find images by content, not just name
+            # Collect all valid images first, then process in parallel
+            image_tasks = []
+            image_stream_names = []
             for stream_path in ole.listdir(streams=True):
                 try:
-                    # Read the stream data first
                     stream_bytes = ole.openstream(stream_path).read()
                     if not stream_bytes:
                         continue
-                    
-                    # Identify the content type from the bytes
                     content_type = self._get_content_type_from_bytes(stream_bytes)
-                    
-                    # If it's a recognized image type, process it
                     if content_type:
-                        image_count += 1
-                        print(f"Found image in stream {'/'.join(stream_path)} ({content_type}). Generating description.")
-                        description = await self._get_image_description(stream_bytes, content_type)
-                        if description:
-                            yield description
+                        image_tasks.append(self._get_image_description(stream_bytes, content_type))
+                        image_stream_names.append('/'.join(stream_path))
                 except Exception as img_e:
-                    print(f"Could not read or process stream {'/'.join(stream_path)}: {img_e}")
+                    print(f"❌ Could not read stream {'/'.join(stream_path)}: {img_e}")
             
-            if image_count > 0:
-                 print(f"Finished processing {image_count} image(s).")
+            if image_tasks:
+                print(f"📸 Found {len(image_tasks)} images. Processing in parallel...")
+                import asyncio
+                image_results = await asyncio.gather(*image_tasks, return_exceptions=True)
+                for i, result in enumerate(image_results):
+                    if isinstance(result, Exception):
+                        print(f"❌ Image processing failed for {image_stream_names[i]}: {result}")
+                    elif result:
+                        yield result
+                print(f"✅ Finished processing {len(image_tasks)} image(s) from DOC file.")
+            else:
+                print("No images found in DOC file.")
 
 
         except Exception as e:

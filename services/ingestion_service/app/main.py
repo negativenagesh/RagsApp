@@ -1,5 +1,4 @@
 import os
-from unittest import result
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -7,7 +6,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from openai import AsyncOpenAI
 
 from .es_client import get_es_client
-from .processor import process_and_ingest_file
+from .index8jan import process_and_ingest_file
 
 app = FastAPI(
     title="RagsApp Ingestion Service",
@@ -79,6 +78,9 @@ async def ingest_file(
         if result.get("status") != "success":
             raise HTTPException(status_code=400, detail=result)
         return {"status": "success", "filename": original_filename, "details": result}
+    except HTTPException:
+        # Preserve upstream status codes and details for easier debugging in gateway logs.
+        raise
     except Exception as e:
         print(f"An error occurred during ingestion: {e}")
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
@@ -93,4 +95,5 @@ def config_check():
         "RAG_UPLOAD_ELASTIC_URL": os.getenv("RAG_UPLOAD_ELASTIC_URL"),
         "ELASTICSEARCH_API_KEY": bool(os.getenv("ELASTICSEARCH_API_KEY")),
         "OPEN_AI_KEY": bool(os.getenv("OPEN_AI_KEY")),
+        "WHATSAPP_PROVIDER": os.getenv("WHATSAPP_PROVIDER", "twilio"),
     }
