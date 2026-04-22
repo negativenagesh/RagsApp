@@ -1,260 +1,233 @@
 import os
 import asyncio
-import numpy as np
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-import traceback
 import yaml
-from pydantic import BaseModel
-import torch
-
+import logging
+import traceback
+import requests
+import time
+import httpx
+import json
+import re
+import sys
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Callable, Awaitable, AsyncGenerator
+import numpy as np
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
 from datetime import datetime, timezone
 from elasticsearch import AsyncElasticsearch
 from elasticsearch.exceptions import TransportError
-from openai import AsyncOpenAI
-from dotenv import load_dotenv
 
-from app.es_client import get_es_client
-
-SHARED_PROMPTS_DIR = Path(__file__).parent.parent.parent.parent / "shared" / "prompts"
+try:
+    from sdk.response import FunctionResponse, Messages
+    from sdk.message import Message
+except ModuleNotFoundError:
+    # Allow running from services/rag_service without manually exporting PYTHONPATH.
+    repo_root = Path(__file__).resolve().parents[3]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from sdk.response import FunctionResponse, Messages
+    from sdk.message import Message
 
 load_dotenv()
 
-async def init_async_openai_client() -> Optional[AsyncOpenAI]:
-  openai_api_key = os.getenv("OPEN_AI_KEY")
-  if not openai_api_key:
-    print("❌ OPENAI_API_KEY not found in .env. OpenAI client will not be functional.")
-    return None
-
-  try:
-    client = AsyncOpenAI(api_key=openai_api_key)
-    print("✅ AsyncOpenAI client initialized.")
-    return client
-  except Exception as e:
-    print(f"❌ Failed to initialize AsyncOpenAI client: {e}")
-    return None
-class FunctionResponse:
-    def __init__(self, message, failed=False):
-        self.message = message
-        self.failed = failed
-
-class Messages(dict):
-    pass
-
-class Message:
-    def __init__(self, params, config):
-        self.params = params
-        self.config = config
-
-SYSTEM_PROMPT_TEMPLATE = """
-**SYSTEM PROMPT**
-
-## YOUR ROLE
-You are a sophisticated AI assistant with expertise in analyzing and synthesizing information from provided documents. Your primary function is to answer user questions accurately and comprehensively, based *exclusively* on the context provided to you.
-
-## TASK
-Your task is to generate a detailed, well-structured, and definitive answer to the user's original query. You must use the information presented in the `CONTEXT` section below. The context contains retrieved text chunks and structured data from a knowledge graph, all extracted from relevant documents.
-
-## INSTRUCTIONS
-1.  **Synthesize, Don't Just List**: Do not simply list the retrieved information. Synthesize the data from the various chunks and knowledge graph entries into a coherent, flowing answer.
-2.  **Strictly Context-Bound**: Your answer **MUST** be based solely on the provided `CONTEXT`. Do not use any external knowledge or make assumptions beyond what is written in the text.
-3.  **Acknowledge Insufficiency**: If the provided context does not contain enough information to answer the question fully, explicitly state that the answer cannot be found in the provided documents. Do not attempt to guess.
-4.  **Structured Formatting**: Present your answer in a clear and organized manner. Use markdown for formatting:
-    *   Use headings (`##`, `###`) to structure your response.
-    *   Use bullet points (`*` or `-`) for lists.
-    *   Use bolding (`**text**`) for key terms and concepts.
-    *   Use tables to present structured data or comparisons where appropriate.
-5.  **Cite Your Sources**: At the end of **each paragraph** in your answer, you **MUST** add a citation referencing the source file. Use the `File` name provided in the context for the information used in that paragraph. For example: `This is a paragraph summarizing information. [some_document.pdf]`. If a paragraph synthesizes information from multiple files, cite all of them, like `[file_one.pdf, file_two.docx]`. This is crucial for traceability.
-
----
-
-**CONTEXT BEGINS**
-
-{context}
-
-**CONTEXT ENDS**
-
----
-
-Based on the context above, provide a comprehensive and well-structured final answer to the original user query. Remember to cite your sources as instructed.
-
-**Final Answer:**
-# """
-
-USER_PROMPT_TEMPLATE = """
-Following all the rules, constraints, and the step-by-step methodology defined in your system role, provide a direct and clear answer to my original question based *only* on the context below.
-
-**Original Question:** "{original_query}"
-
----
-**CONTEXT BEGINS**
-
-{context}
-
-**CONTEXT ENDS**
----
-
-**Final Answer:**
-"""
-
-OPENAI_API_KEY = os.getenv("OPEN_AI_KEY")
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
-OPENAI_EMBEDDING_DIMENSIONS = int(os.getenv("OPENAI_EMBEDDING_DIMENSIONS", 3072))
-ELASTICSEARCH_URL = os.getenv("RAG_UPLOAD_ELASTIC_URL")
+OPENAI_EMBEDDING_DIMENSIONS = 3072
+RERANKER_MODEL_ID = os.getenv("RERANKER_MODEL_ID", "BAAI/bge-reranker-base")
+
+ELASTICSEARCH_URL = os.getenv("RAG_UPLOAD_ELASTIC_URL")                    
 ELASTICSEARCH_API_KEY = os.getenv("ELASTICSEARCH_API_KEY")
 
-async def get_openai_client() -> AsyncOpenAI:
-    return AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+def _extract_files_cited_in_answer(answer: str, candidate_files: set[str]) -> List[str]:
+    """Extract cited file names from bracket citations and keep only known retrieved files."""
+    if not answer or not candidate_files:
+        return []
+
+    cited: set[str] = set()
+    for bracket_content in re.findall(r"\[([^\[\]]+)\]", answer):
+        for raw_part in bracket_content.split(","):
+            token = raw_part.strip().strip("`\"'")
+            if not token:
+                continue
+            # Allow exact match first.
+            if token in candidate_files:
+                cited.add(token)
+                continue
+            # Then allow basename match.
+            token_base = os.path.basename(token)
+            for candidate in candidate_files:
+                if token_base == os.path.basename(candidate):
+                    cited.add(candidate)
+                    break
+
+    return sorted(cited)
+
+
+def _sanitize_whatsapp_text(text: str, strip_leading_markdown: bool = False) -> str:
+    """Normalize model output to WhatsApp-friendly formatting."""
+    if not text:
+        return ""
+
+    cleaned = str(text).replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove markdown heading syntax and horizontal rules.
+    cleaned = re.sub(r"(?m)^\s*#{1,6}\s*", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*[-*_]{3,}\s*$", "", cleaned)
+
+    # Convert markdown bold (**text**) to WhatsApp-friendly bold (*text*).
+    cleaned = re.sub(r"\*\*(.+?)\*\*", r"*\1*", cleaned)
+
+    if strip_leading_markdown:
+        cleaned = re.sub(r"^\s*#{1,6}\s*", "", cleaned)
+        cleaned = re.sub(r"^\s*[-*_]{3,}\s*", "", cleaned)
+
+    # Avoid emitting orphan heading fragments in streaming starts.
+    if cleaned.strip() in {"#", "##", "###", "----", "***"}:
+        return ""
+
+    return cleaned
+
+def safe_fire_and_forget(coro):
+  try:
+    loop = asyncio.get_running_loop()
+    loop.create_task(ignore_exceptions(coro))
+  except RuntimeError:
+    pass  # No event loop available; skip silently
+
+async def ignore_exceptions(coro):
+  try:
+    await coro
+  except Exception:
+    pass
+
+async def init_async_openai_client(text_model) -> Optional[AsyncOpenAI]:
+    openai_api_key = os.getenv("OPEN_AI_KEY") or os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        print("❌ OPENAI_API_KEY not found in .env. OpenAI client will not be functional.")
+        return None
+
+    try:
+        client = AsyncOpenAI(api_key=openai_api_key)
+        print("✅ AsyncOpenAI client initialized.")
+        return client
+    except Exception as e:
+        print(f"❌ Failed to initialize AsyncOpenAI client: {e}")
+        return None
+
+async def check_async_elasticsearch_connection() -> Optional[AsyncElasticsearch]:
+    try:
+        print('Connecting to Elsatic client ELASTICSEARCH_URL:-', ELASTICSEARCH_URL)
+        es_client = None
+        if ELASTICSEARCH_API_KEY:
+            es_client = AsyncElasticsearch(
+                ELASTICSEARCH_URL,
+                api_key=ELASTICSEARCH_API_KEY,
+                request_timeout=60,
+                retry_on_timeout=True
+            )
+        else:
+            es_client = AsyncElasticsearch(
+                hosts=[ELASTICSEARCH_URL],
+                request_timeout=60,
+                retry_on_timeout=True
+            )
+        
+        if not await es_client.ping():
+            print("❌ Ping to Elasticsearch cluster failed. URL may be incorrect or server is down.")
+            return None
+
+        print("✅ AsyncElasticsearch client initialized.")
+        return es_client
+    except Exception as e:
+       print(f"❌ Failed to initialize AsyncElasticsearch client: {e}")
+       return None
+
 
 class RAGFusionRetriever:
-    def __init__(self, params: Any, config: Any, es_client: Any, aclient_openai: Optional[AsyncOpenAI]):
+    def __init__(self, params: Any, config: Any, es_client: Any, aclient_openai: Optional[AsyncOpenAI], token: Any):
         self.aclient_openai = aclient_openai
         self.params = params
         self.config = config
         self.es_client = es_client
-        self.rag_fusion_prompt_template = self._load_prompt_template("rag_fusion")
-        self.embedding_dims = OPENAI_EMBEDDING_DIMENSIONS
-        
+        self.token = token
         self.reranker = None
         self.provence_pruner = None
+        self.embedding_dims = OPENAI_EMBEDDING_DIMENSIONS
         self.deep_research = self.params.get('deep_research', False)
+
+        # Index configuration — default to 'ragsapp'
+        index_name_config = config.get('index_name', 'ragsapp')
+        self.index_names = [idx.strip() for idx in index_name_config.split(',') if idx.strip()]
+        if not self.index_names:
+            self.index_names = ['ragsapp']
+        self.index_name = self.index_names[0]
+        print(f"Configured indexes: {self.index_names}")
+
+    def _get_conversation_history(self) -> List[Dict[str, str]]:
+        raw_history = self.params.get("conversation_history") or []
+        if not isinstance(raw_history, list):
+            return []
+
+        normalized: List[Dict[str, str]] = []
+        for item in raw_history:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "user")).strip().lower()
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            normalized.append({"role": role, "content": content})
+        return normalized
+
+    def _render_conversation_history(self, max_turns: int = 8, max_chars: int = 1600) -> str:
+        history = self._get_conversation_history()
+        if not history:
+            return "(none)"
+
+        lines: List[str] = []
+        for turn in history[-max_turns:]:
+            role = turn.get("role", "user")
+            prefix = "User" if role == "user" else "Assistant"
+            content = re.sub(r"\s+", " ", turn.get("content", "")).strip()
+            if len(content) > 260:
+                content = content[:257].rstrip() + "..."
+            lines.append(f"{prefix}: {content}")
+
+        rendered = "\n".join(lines) if lines else "(none)"
+        if len(rendered) > max_chars:
+            rendered = rendered[-max_chars:]
+        return rendered
 
     def _load_prompt_template(self, prompt_name: str) -> str:
         try:
-            prompt_file_path = SHARED_PROMPTS_DIR / f"{prompt_name}.yaml"
+            prompt_file_path = Path("./prompts") / f"{prompt_name}.yaml"
             with open(prompt_file_path, 'r') as f:
                 prompt_data = yaml.safe_load(f)
+
             if prompt_data and prompt_name in prompt_data and "template" in prompt_data[prompt_name]:
-                return prompt_data[prompt_name]["template"]
+                template_content = prompt_data[prompt_name]["template"]
+                print(f"Successfully loaded prompt template for '{prompt_name}'.")
+                return template_content
             else:
+                print(f"Prompt template for '{prompt_name}' not found or invalid in {prompt_file_path}.")
                 raise ValueError(f"Invalid prompt structure for {prompt_name}")
+        except FileNotFoundError:
+            print(f"Prompt file not found: {prompt_file_path}")
+            raise
         except Exception as e:
             print(f"Error loading prompt '{prompt_name}': {e}")
             raise
-    
-    async def _fetch_schema_chunks_by_file(self) -> Dict[str, str]:
-        """
-        Returns a mapping: file_name -> first chunk_text for that file for all document types.
-        Collects exactly one sample chunk per file type.
-        """
-        index_name = self.config.get('index_name')
-        schema_chunks = {}
-        
-        try:
-            # Primary approach: Try to get file names from metadata.file_name.keyword field
-            try:
-                # First, get a list of all unique file names in the index
-                file_names_response = await self.es_client.search(
-                    index=index_name,
-                    size=0,  # We don't need documents, just the aggregation
-                    aggs={
-                        "unique_files": {
-                            "terms": {
-                                "field": "metadata.file_name.keyword",
-                                "size": 1000  # Get up to 1000 unique file names
-                            }
-                        }
-                    }
-                )
-                
-                # Extract the unique file names from the aggregation
-                unique_files = [
-                    bucket.get("key") 
-                    for bucket in file_names_response.get("aggregations", {}).get("unique_files", {}).get("buckets", [])
-                ]
-                
-                print(f"Found {len(unique_files)} unique files in index: {unique_files}")
-                
-                # For each unique file, get one sample chunk
-                for file_name in unique_files:
-                    try:
-                        # Get one chunk from this file
-                        file_chunk_response = await self.es_client.search(
-                            index=index_name,
-                            size=1,
-                            query={
-                                "term": {
-                                    "metadata.file_name.keyword": file_name
-                                }
-                            },
-                            _source_includes=["chunk_text", "metadata.file_name"]
-                        )
-                        
-                        # Extract the chunk text
-                        hits = file_chunk_response.get("hits", {}).get("hits", [])
-                        if hits:
-                            source = hits[0].get("_source", {})
-                            chunk_text = source.get("chunk_text", "")
-                            schema_chunks[file_name] = chunk_text
-                            print(f"Added sample chunk for file: {file_name} (length: {len(chunk_text)} chars)")
-                    except Exception as e:
-                        print(f"Error fetching chunk for file {file_name}: {e}")
-                        continue
-                    
-            except Exception as e:
-                print(f"Error during file name aggregation: {e}")
-                # Continue to fallbacks if the aggregation approach fails
-            
-            # First fallback: If no chunks found by file name, just get any documents
-            if not schema_chunks:
-                print("No schema chunks found by file name aggregation, trying direct search...")
-                direct_search_response = await self.es_client.search(
-                    index=index_name,
-                    size=20,  # Get a reasonable number of docs
-                    _source_includes=["chunk_text", "metadata.file_name"]
-                )
-                
-                seen_files = set()
-                for hit in direct_search_response.get('hits', {}).get('hits', []):
-                    source = hit.get('_source', {})
-                    metadata = source.get('metadata', {})
-                    file_name = metadata.get('file_name', f"unknown_file_{len(seen_files)}")
-                    
-                    if file_name and file_name not in seen_files:
-                        chunk_text = source.get('chunk_text', '')
-                        if chunk_text:
-                            schema_chunks[file_name] = chunk_text
-                            seen_files.add(file_name)
-                            print(f"Fallback: Added sample chunk for file: {file_name}")
-                            
-            # Final fallback: If still no chunks found, just get one document with ANY structure
-            if not schema_chunks:
-                print("Second fallback: Getting any document from the index...")
-                try:
-                    # Simplest possible query to get just one document
-                    any_doc_response = await self.es_client.search(
-                        index=index_name,
-                        size=1,
-                        query={"match_all": {}}
-                    )
-                    
-                    hits = any_doc_response.get('hits', {}).get('hits', [])
-                    if hits:
-                        source = hits[0].get('_source', {})
-                        # Look for text in common field names
-                        for text_field in ['chunk_text', 'text', 'content', 'body']:
-                            if text_field in source:
-                                schema_chunks["generic_document"] = source.get(text_field)
-                                print(f"Emergency fallback: Found content in '{text_field}' field")
-                                break
-                except Exception as e:
-                    print(f"Final fallback query failed: {e}")
-                    
-            print(f"Successfully retrieved {len(schema_chunks)} schema chunks for keyword extraction")
-            return schema_chunks
-                    
-        except Exception as e:
-            print(f"❌ Error fetching schema chunks by file: {e}")
-            traceback.print_exc()
-            return {}  # Return empty dict as last resort if everything fails
-    
+
+
     async def _call_openai_api(
         self,
         model_name: str,
         payload_messages: List[Dict[str, Any]],
         max_tokens: int = 1024,
-        temperature: float = 0.1
+        temperature: float = 0.1,
+        stream_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> str:
         """A unified async method to call OpenAI text models with retry logic."""
         if not self.aclient_openai:
@@ -262,22 +235,48 @@ class RAGFusionRetriever:
             return ""
 
         print(f"*** openai messages: {payload_messages}")
-        max_retries = 3
+        max_retries = 10
         base_delay_seconds = 10
 
         for attempt in range(max_retries):
             try:
                 start_time = datetime.now(timezone.utc)
-                response = await self.aclient_openai.chat.completions.create(
-                    model=model_name,
-                    messages=payload_messages,
-                    max_tokens=max_tokens,
-                )
+                api_call_start = time.time()
+                if stream_callback:
+                    response = await self.aclient_openai.chat.completions.create(
+                        model=model_name,
+                        messages=payload_messages,
+                        max_tokens=max_tokens,
+                        stream=True,
+                    )
+                    content_parts: List[str] = []
+                    async for event in response:
+                        if not event.choices:
+                            continue
+                        delta = event.choices[0].delta.content
+                        if not delta:
+                            continue
+                        content_parts.append(delta)
+                        try:
+                            await stream_callback(delta)
+                        except Exception as callback_error:
+                            print(f"Stream callback failed: {callback_error}")
+                    content = "".join(content_parts)
+                else:
+                    response = await self.aclient_openai.chat.completions.create(
+                        model=model_name,
+                        messages=payload_messages,
+                        max_tokens=max_tokens,
+                    )
+                    content = response.choices[0].message.content
+
+                api_call_duration = time.time() - api_call_start
                 
-                content = response.choices[0].message.content
+                # if response.usage:
+                #     safe_fire_and_forget(calculatePriceByApi(self.config, self.params, response.usage, start_time, other_details=None, token=self.token))
 
                 if content:
-                    print(f"OpenAI API call successful. Preview: {content}")
+                    print(f"✅ OpenAI API call successful in {api_call_duration:.2f}s. Preview: {content[:100].strip()}...")
                     return content
                 else:
                     print(f"OpenAI API returned empty content. Attempt {attempt + 1}/{max_retries}")
@@ -293,43 +292,7 @@ class RAGFusionRetriever:
         print("Max retries reached for OpenAI API call. Returning empty string.")
         return ""
 
-    async def _classify_query_type(self, query: str) -> str:
-        """
-        Uses an LLM to classify the user's query into a specific category.
-        """
-        classification_prompt = f"""
-        You are an expert query classifier. Your task is to classify the user's query into one of the following categories based on its intent. Respond with ONLY the category name.
 
-        Categories:
-        - `factual_lookup`: For queries asking for specific, discrete pieces of information, like a number, name, date, or a specific definition. Example: "What is the lease start date for Tenant X?" or "How many floors does the building have?"
-        - `summary_extraction`: For queries that ask for a summary of a topic, document, or concept. Example: "Summarize the main points of the contract." or "Provide an overview of the quarterly financial report."
-        - `comparison`: For queries that ask to compare two or more items. Example: "Compare the lease terms for Tenant A and Tenant B."
-        - `complex_analysis`: For broad, open-ended questions that require synthesizing information from multiple sources or analyzing relationships. This is the default for queries that don't fit other categories. Example: "What are the potential risks associated with the new project?"
-
-        User Query: "{query}"
-
-        Category:
-        """
-        valid_types = ['factual_lookup', 'summary_extraction', 'comparison', 'complex_analysis']
-        
-        query_type = ""
-        print(f"Classifying query via OpenAI: '{query}'")
-        messages = [{"role": "user", "content": classification_prompt}]
-        query_type = await self._call_openai_api(
-            model_name=OPENAI_CHAT_MODEL,
-            payload_messages=messages,
-            max_tokens=20,
-            temperature=0.0
-        )
-
-        cleaned_query_type = query_type.strip().lower()
-        if cleaned_query_type in valid_types:
-            print(f"✅ Query classified as: '{cleaned_query_type}'")
-            return cleaned_query_type
-        else:
-            print(f"⚠️ Warning: LLM returned invalid query type '{cleaned_query_type}'. Defaulting to 'complex_analysis'.")
-            return 'complex_analysis'
-    
     async def _prune_documents(self, query: str, documents: List[Dict[str, Any]], doc_type: str) -> List[Dict[str, Any]]:
         if not self.provence_pruner:
             print("Provence pruner not initialized. Skipping pruning.")
@@ -380,39 +343,152 @@ class RAGFusionRetriever:
         print(f"Successfully pruned {len(documents)} {doc_type} documents.")
         return pruned_docs
     
-    async def _generate_subqueries(self, original_query: str,num_subqueries: int = 2) -> List[str]:
+    async def _process_single_subquery(
+        self,
+        sq_text: str,
+        initial_candidate_pool_size: int,
+        top_k_kg_entities: int
+    ) -> List[Dict[str, Any]]:
+        """Process a single subquery: retrieves chunks via semantic + keyword search,
+        then performs internal RRF fusion to produce ONE normalized ranked list.
+        The caller collects fused lists from all subqueries and performs cross-subquery RRF.
+        """
+        print(f"\n--- Processing Subquery: '{sq_text}' ---")
+        ranked_lists: List[List[Dict[str, Any]]] = []  # Raw lists collected, fused before return
         
-        if not self.rag_fusion_prompt_template:
-            print("RAG Fusion prompt template not loaded. Cannot generate subqueries.")
-            return []
+        try:
+            # Generate embedding for the subquery
+            embedding_result = await self._generate_embedding([sq_text])
+            if isinstance(embedding_result, Exception):
+                embedding_result = []
+            
+            if isinstance(embedding_result, Exception) or not embedding_result or not embedding_result[0]:
+                print(f"⚠️ Failed to generate embedding for subquery: '{sq_text}'. Keyword-only retrieval.")
+                # No semantic search possible — keyword search only
+                keyword_tasks = [
+                    self._keyword_search_chunks(sq_text, initial_candidate_pool_size)
+                ]
+                keyword_results = await asyncio.gather(*keyword_tasks, return_exceptions=True)
+                for res in keyword_results:
+                    if isinstance(res, list) and res:
+                        ranked_lists.append(res)
+                # Internal RRF: normalize keyword-only signals into one fused list
+                if ranked_lists:
+                    fused = self._fuse_ranked_lists_with_rrf(ranked_lists, top_k=initial_candidate_pool_size)
+                    print(f"Internal RRF fused {len(ranked_lists)} keyword-only lists into {len(fused)} chunks for subquery: '{sq_text[:50]}...'")
+                    return fused
+                return []
+                
+            query_embedding = embedding_result[0]
 
-        formatted_prompt = self.rag_fusion_prompt_template.format(
-            num_outputs=num_subqueries, message=original_query
-        )
+            try:
+                # Run semantic search and single raw keyword search concurrently
+                semantic_task = self._semantic_search_chunks(query_embedding, initial_candidate_pool_size)
+                keyword_tasks = [
+                    self._keyword_search_chunks(sq_text, initial_candidate_pool_size)
+                ]
+                
+                all_tasks = [semantic_task] + keyword_tasks
+                results = await asyncio.gather(*all_tasks, return_exceptions=True)
+                
+                # First result is semantic search
+                if isinstance(results[0], list) and results[0]:
+                    ranked_lists.append(results[0])
+                    print(f"Semantic search returned {len(results[0])} chunks for subquery: '{sq_text[:50]}...'")
+                elif isinstance(results[0], Exception):
+                    print(f"⚠️ Semantic search failed for subquery '{sq_text[:50]}...': {results[0]}")
+                
+                # Remaining result is the unified raw keyword search
+                if isinstance(results[1], list) and results[1]:
+                    ranked_lists.append(results[1])
+                    print(f"Keyword search returned {len(results[1])} chunks for subquery: '{sq_text[:50]}...'")
+                elif isinstance(results[1], Exception):
+                    print(f"⚠️ Keyword search failed for subquery '{sq_text[:50]}...': {results[1]}")
+                        
+            except Exception as e:
+                print(f"⚠️ Search failed for subquery '{sq_text}': {e}")
+                    
+        except Exception as e:
+            print(f"⚠️ Error processing subquery '{sq_text}': {e}")
+        
+        # Normalize semantic + keyword signals into ONE fused list for this subquery.
+        if ranked_lists:
+            fused = self._fuse_ranked_lists_with_rrf(ranked_lists, top_k=initial_candidate_pool_size)
+            print(f"Internal RRF fused {len(ranked_lists)} lists into {len(fused)} chunks for subquery: '{sq_text[:50]}...'")
+            return fused
+        
+        print(f"Subquery '{sq_text[:50]}...' produced no results")
+        return []
+
+    async def _generate_subqueries(
+        self,
+        original_query: str,
+        num_subqueries: int = 2
+    ) -> List[Dict[str, Any]]:
+        """Generate subqueries via a fast LLM call and extract keywords locally.
+        Returns a list of dicts: [{"query": str, "keywords": [str, ...]}, ...]
+        """
+        system_prompt = f"""You are an expert at search query decomposition for information retrieval.
+Given the user's original query, break down the intent and generate exactly {num_subqueries} distinct search subqueries.
+- Each subquery must target a distinct aspect/intent of the original query.
+- Each subquery should be self-contained and searchable independently.
+- Output ONLY the subqueries, separated by a newline. Do not output anything else. Do not use bullets or numbers.
+"""
+        user_prompt = f"""**Original User Query:** "{original_query}" """
+
         messages = [
-            {"role": "system", "content": "You are an AI assistant that generates multiple search queries based on a single user query."},
-            {"role": "user", "content": formatted_prompt}
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": user_prompt.strip()}
         ]
-        
+
         llm_response_content = ""
-        
-        print(f"Generating {num_subqueries} subqueries via OpenAI for: '{original_query}'")
+        print(f"Generating {num_subqueries} subqueries via text endpoint for: '{original_query}'")
         llm_response_content = await self._call_openai_api(
             model_name=OPENAI_CHAT_MODEL,
             payload_messages=messages,
-            max_tokens=500,
-            temperature=0.5
+            max_tokens=150,
+            temperature=0.3
         )
 
         if not llm_response_content:
-            print("LLM returned empty content for subqueries.")
+            print("⚠️ LLM returned empty content for subqueries.")
             return []
 
-        splitter = '\n\n'
-        subqueries = [sq.strip() for sq in llm_response_content.split(splitter) if sq.strip()]
-        print(f"✅ Successfully generated {len(subqueries)} subqueries: {subqueries}")
-        return subqueries[:num_subqueries]
-    
+        # Parse plaintext response
+        lines = [line.strip() for line in llm_response_content.split('\n') if line.strip()]
+        
+        # Clean potential bullets/numberings if the LLM adds them despite instructions
+        clean_lines = []
+        for line in lines:
+            # removing '1.', '-', '*', etc. at the start
+            cleaned = re.sub(r'^[\d\.\-\*\s]+', '', line).strip()
+            # remove surrounding double quotes if LLM added them
+            if cleaned.startswith('"') and cleaned.endswith('"'):
+                cleaned = cleaned[1:-1].strip()
+            if cleaned:
+                clean_lines.append(cleaned)
+                
+        results: List[Dict[str, Any]] = []
+        seen_queries = set()
+        for query_text in clean_lines[:num_subqueries]:
+            q_key = query_text.lower()
+            if q_key in seen_queries:
+                continue
+            seen_queries.add(q_key)
+
+            results.append({
+                "query": query_text
+            })
+
+        if results:
+            print(f"✅ Generated {len(results)} subqueries directly:")
+            for i, r in enumerate(results):
+                print(f"   Subquery {i+1}: '{r['query']}'")
+        else:
+            print("⚠️ Could not parse subqueries text. Returning empty.")
+
+        return results
+
     async def _generate_embedding(self, texts: List[str]) -> List[List[float]]:
         if not texts: return []
         
@@ -430,7 +506,7 @@ class RAGFusionRetriever:
                 response = await self.aclient_openai.embeddings.create(
                     input=processed_batch_texts, 
                     model=OPENAI_EMBEDDING_MODEL, 
-                    dimensions=self.embedding_dims
+                    dimensions=self.embedding_dims  #changed
                 )
                 all_embeddings.extend([item.embedding for item in response.data])
             return all_embeddings
@@ -449,217 +525,314 @@ class RAGFusionRetriever:
             "k": top_k,
             "num_candidates": top_k * 10
         }
-        index_name = self.config.get('index_name')
-        print('index name in _semantic_search_chunks;-', index_name)
-        # print(f"Performing semantic search for chunks with top_k={top_k}. Query: {json.dumps(knn_query)}")
-        try:
-            response = await self.es_client.search(
-                index=index_name,
-                knn=knn_query,
-                size=top_k,
-                _source_includes=["chunk_text", "metadata.file_name", "metadata.doc_id", "metadata.page_number", "metadata.chunk_index_in_page"]
-            )
-            results = []
-            for hit in response.get('hits', {}).get('hits', []):
-                source = hit.get('_source', {})
-                metadata = source.get('metadata', {})
-                results.append({
-                    "id":hit.get('_id'),
-                    "text": source.get('chunk_text'),
-                    "score": hit.get('_score'),
-                    "file_name": metadata.get('file_name'),
-                    "doc_id": metadata.get('doc_id'),
-                    "page_number": metadata.get('page_number'),
-                    "chunk_index_in_page": metadata.get('chunk_index_in_page')
-                })
-            print(f"Semantic search found {len(results)} chunks.")
-            return results
-        except TransportError as e:
-            print(f"Elasticsearch semantic search error: {e}")
-            return []
+        
+        async def search_single_index(index_name: str) -> List[Dict[str, Any]]:
+            """Perform semantic search on a single index and retrieve all fields."""
+            # Known fields to exclude from custom_fields
+            KNOWN_FIELDS = {'chunk_text', 'embedding', 'metadata'}
+            
+            try:
+                response = await self.es_client.search(
+                    index=index_name,
+                    knn=knn_query,
+                    size=top_k,
+                    _source_excludes=["embedding"]  # Retrieve all fields except embedding
+                )
+                results = []
+                for hit in response.get('hits', {}).get('hits', []):
+                    source = hit.get('_source', {})
+                    metadata = source.get('metadata', {})
+                    
+                    # Extract custom fields (fields not in KNOWN_FIELDS)
+                    custom_fields = {k: v for k, v in source.items() if k not in KNOWN_FIELDS}
+                    
+                    results.append({
+                        "id": hit.get('_id'),
+                        "source_index": index_name,  # Track which index this came from
+                        "text": source.get('chunk_text'),
+                        "score": hit.get('_score'),
+                        "file_name": metadata.get('file_name'),
+                        "doc_id": metadata.get('doc_id'),
+                        "page_number": metadata.get('page_number'),
+                        "chunk_index_in_page": metadata.get('chunk_index_in_page'),
+                        "custom_fields": custom_fields
+                    })
+                print(f"Semantic search found {len(results)} chunks in {index_name}.")
+                return results
+            except TransportError as e:
+                print(f"Elasticsearch semantic search error on index {index_name}: {e}")
+                return []
+        
+        print(f'Performing semantic search across indexes: {self.index_names}')
+        
+        # Search all indexes concurrently
+        tasks = [search_single_index(idx) for idx in self.index_names]
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Merge results - use composite key (source_index + id) for deduplication
+        # This ensures same document in different indexes is kept as separate results
+        all_results = []
+        seen_composite_ids = set()
+        for result in results_list:
+            if isinstance(result, list):
+                for item in result:
+                    # Use composite key: source_index + document_id
+                    composite_key = f"{item.get('source_index', '')}:{item['id']}"
+                    if composite_key not in seen_composite_ids:
+                        seen_composite_ids.add(composite_key)
+                        all_results.append(item)
+        
+        # Sort by score and return top_k
+        all_results.sort(key=lambda x: x.get('score', 0) or 0, reverse=True)
+        print(f"Semantic search found {len(all_results)} chunks across {len(self.index_names)} indexes.")
+        return all_results[:top_k]
 
-    async def _structured_kg_search(self, subquery_embedding: List[float], top_k: int = 3,top_k_entities: int = 5) -> List[Dict[str, Any]]:
-        
+    async def _structured_kg_search(self, query_embedding: List[float], top_k: int, top_k_entities: int) -> List[Dict[str, Any]]:
         """
-        Performs a semantic search on nested entity description embeddings, then filters
-        for the top N entities within each returned document based on cosine similarity.
-        """
-        if not subquery_embedding:
-            print("Structured KG search skipped: No subquery embedding provided.")
-            return []
+        Search for entities in the knowledge graph using embeddings of their descriptions.
         
-        knn_query = {
-            "field": "metadata.entities.description_embedding",
-            "query_vector": subquery_embedding,
-            "k": top_k,
-            "num_candidates": top_k * 10,
-            "filter": {
-                "bool": {
-                    "must_not": [
-                        {"wildcard": {"metadata.file_name.keyword": "*.xlsx"}},
-                        {"wildcard": {"metadata.file_name.keyword": "*.csv"}}
+        Args:
+            query_embedding: Vector embedding for the query
+            top_k: Number of results to return
+            top_k_entities: Number of entities to return
+            
+        Returns:
+            List of matching entity information with scores
+        """
+        try:
+            index_name = self.config.get('index_name')
+                        
+            # Create the main query body
+            query_body = {
+                "size": top_k,
+                "_source": {
+                    "includes": [
+                        "metadata.entities",
+                        "metadata.file_name",
+                        "metadata.doc_id",
+                        "metadata.page_number",
+                        "metadata.chunk_index_in_page",
+                        "chunk_text"
                     ]
+                },
+                "query": {
+                    "nested": {
+                        "path": "metadata.entities",
+                        "score_mode": "max",
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {
+                                        "exists": {
+                                            "field": "metadata.entities.description_embedding"
+                                        }
+                                    },
+                                    {
+                                        "script_score": {
+                                            "query": {"match_all": {}},
+                                            "script": {
+                                                "source": "cosineSimilarity(params.query_vector, 'metadata.entities.description_embedding') + 1.0",
+                                                "params": {
+                                                    "query_vector": query_embedding
+                                                }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                        "inner_hits": {
+                            "size": 3,
+                            "_source": ["name", "type", "description"]
+                        }
+                    }
                 }
             }
-        }
-        index_name = self.config.get('index_name')
-        print('index name in _structured_kg_search:-', index_name)
-        
-        # print(f"Performing structured KG search, KNN Query: {json.dumps(knn_query,indent=2)}")
-        try:
+            
+            # Execute search using the Elasticsearch client
             response = await self.es_client.search(
                 index=index_name,
-                knn=knn_query,
-                size=top_k,
-                _source=["chunk_text", "metadata"]
+                body=query_body
             )
             
-            final_results=[]
-            query_vec=np.array(subquery_embedding)
+            results = []
             
-            for hit in response.get('hits', {}).get('hits', []):
-                source = hit.get('_source', {})
-                metadata_from_hit = source.get('metadata', {})
-                all_entities = metadata_from_hit.get('entities', [])
-                all_relationships = metadata_from_hit.get('relationships', [])
-
-                if not all_entities:
-                    continue
-
-                # Score each entity in the document against the subquery embedding
-                scored_entities = []
-                for entity in all_entities:
-                    entity_embedding_list = entity.get("description_embedding")
-                    if entity_embedding_list:
-                        entity_vec = np.array(entity_embedding_list)
-                        # Calculate cosine similarity, handle potential norm=0
-                        norm_query = np.linalg.norm(query_vec)
-                        norm_entity = np.linalg.norm(entity_vec)
-                        if norm_query > 0 and norm_entity > 0:
-                            similarity = np.dot(query_vec, entity_vec) / (norm_query * norm_entity)
-                            scored_entities.append((similarity, entity))
-
-                # Sort entities by score and take top N
-                scored_entities.sort(key=lambda x: x[0], reverse=True)
-                top_entities = [entity for score, entity in scored_entities[:top_k_entities]]
-                top_entity_names = {entity['name'] for entity in top_entities if entity.get('name')}
-
-                # Filter relationships based on the top entities
-                filtered_relationships = []
-                if top_entity_names:
-                    for rel in all_relationships:
-                        if rel.get('source_entity') in top_entity_names or rel.get('target_entity') in top_entity_names:
-                            filtered_relationships.append(rel)
-
-                # If we found any top entities, create a result object for this document
-                if top_entities:
-                    final_results.append({
-                        "id": hit.get('_id'),
-                        "chunk_text": source.get('chunk_text'),
-                        "entities": top_entities,
-                        "relationships": filtered_relationships,
-                        "score": hit.get('_score'), # This is the parent document's score
-                        "file_name": metadata_from_hit.get('file_name'),
-                        "doc_id": metadata_from_hit.get('doc_id'),
-                        "page_number": metadata_from_hit.get('page_number'),
-                        "chunk_index_in_page": metadata_from_hit.get('chunk_index_in_page')
-                    })
-            
-            print(f"Semantic KG search found and processed {len(final_results)} documents.")
-            return final_results
-        except TransportError as e:
-            print(f"Elasticsearch semantic KG search error: {e}", exc_info=True)
-            return []
-    
-    async def _unified_rrf_search(self, query_text: str, query_embedding: List[float], top_k: int, top_k_entities: int, k_rrf: int = 60) -> List[Dict[str, Any]]:
-        """
-        Performs a unified RRF search across four sources: vector/keyword on chunks and vector/keyword on KG.
-        """
-        print(f"Performing Unified RRF Search for: '{query_text}'")
-        tasks = [
-            self._semantic_search_chunks(query_embedding, top_k),
-            self._keyword_search_chunks(query_text, top_k),
-        ]
-        if top_k_entities > 0:
-            tasks.extend([
-                self._structured_kg_search(query_embedding, top_k, top_k_entities),
-                self._keyword_search_kg(query_text, top_k)
-            ])
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        if top_k_entities > 0:
-            vec_chunks, key_chunks, vec_kg, key_kg = [res if isinstance(res, list) else [] for res in results]
-        else:
-            vec_chunks, key_chunks = [res if isinstance(res, list) else [] for res in results]
-            vec_kg, key_kg = [], []
+            if response["hits"]["total"]["value"] > 0:
+                print(f"Found {response['hits']['total']['value']} documents with entity embeddings in index.")
                 
-        ranks = {
-            'vec_chunks': {doc['id']: i + 1 for i, doc in enumerate(vec_chunks)},
-            'key_chunks': {doc['id']: i + 1 for i, doc in enumerate(key_chunks)},
-            'vec_kg': {doc['id']: i + 1 for i, doc in enumerate(vec_kg)},
-            'key_kg': {doc['id']: i + 1 for i, doc in enumerate(key_kg)}
-        }
+                # Process results
+                for hit in response["hits"]["hits"]:
+                    score = hit["_score"]
+                    source = hit["_source"]
+                    metadata = source.get("metadata", {})
+                    doc_id = metadata.get("doc_id", "unknown")
+                    file_name = metadata.get("file_name", "unknown")
+                    page_number = metadata.get("page_number")
+                    chunk_index_in_page = metadata.get("chunk_index_in_page")
+                    chunk_text = source.get("chunk_text", "")
+                    
+                    # Process inner hits (matching entities)
+                    if "inner_hits" in hit and "metadata.entities" in hit["inner_hits"]:
+                        entity_hits = hit["inner_hits"]["metadata.entities"]["hits"]["hits"]
+                        
+                        entities = []
+                        relationships = metadata.get("relationships", [])
+                        
+                        for entity_hit in entity_hits:
+                            entity = entity_hit["_source"]
+                            entities.append({
+                                "name": entity.get("name", ""),
+                                "type": entity.get("type", ""),
+                                "description": entity.get("description", "")
+                            })
+                        
+                        result_item = {
+                            "id": hit["_id"],
+                            "score": score,
+                            "doc_id": doc_id,
+                            "file_name": file_name,
+                            "page_number": page_number,
+                            "chunk_index_in_page": chunk_index_in_page,
+                            "chunk_text": chunk_text,
+                            "entities": entities,
+                            "relationships": relationships
+                        }
+                        
+                        results.append(result_item)
+            else:
+                print("No documents with entity embeddings found. Check your data processing pipeline.")
+                
+            # Sort by score (highest first)
+            results.sort(key=lambda x: x["score"], reverse=True)
+            
+            # Return top-k results
+            final_results = results[:top_k_entities]
+            print(f"KG search returning {len(final_results)} results out of {len(results)} found.")
+            
+            return final_results
+            
+        except Exception as e:
+            print(f"Error in structured KG search: {e}")
+            traceback.print_exc()
+            return []
 
-        all_docs = {}
-        for doc in vec_chunks + key_chunks + vec_kg + key_kg:
-            if doc['id'] not in all_docs or 'entities' in doc:
-                all_docs[doc['id']] = doc
+    def _fuse_ranked_lists_with_rrf(self, ranked_lists: List[List[Dict[str, Any]]], k_rrf: int = 60, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Fuse multiple ranked lists with Reciprocal Rank Fusion (RRF) using composite keys.
+        """
+        if not ranked_lists:
+            return []
 
-        for doc_id, doc in all_docs.items():
+        def get_composite_key(doc: Dict[str, Any]) -> str:
+            source_index = doc.get('source_index', '')
+            doc_id = doc.get('id', '')
+            return f"{source_index}:{doc_id}"
+
+        all_docs: Dict[str, Dict[str, Any]] = {}
+        rank_maps: List[Dict[str, int]] = []
+
+        for ranked_list in ranked_lists:
+            rank_map: Dict[str, int] = {}
+            for idx, doc in enumerate(ranked_list):
+                composite_key = get_composite_key(doc)
+                rank_map[composite_key] = idx + 1
+                if composite_key not in all_docs:
+                    all_docs[composite_key] = doc
+            rank_maps.append(rank_map)
+
+        for composite_key, doc in all_docs.items():
             score = 0.0
-            for rank_list in ranks.values():
-                if doc_id in rank_list:
-                    score += 1.0 / (k_rrf + rank_list[doc_id])
+            for rank_map in rank_maps:
+                if composite_key in rank_map:
+                    score += 1.0 / (k_rrf + rank_map[composite_key])
             doc['score'] = score
-        
-        sorted_docs = sorted(all_docs.values(), key=lambda x: x['score'], reverse=True)
-        print(f"Unified RRF search fused {len(sorted_docs)} unique documents.")
-        return sorted_docs
-    
+
+        fused_docs = sorted(all_docs.values(), key=lambda x: x.get('score', 0) or 0, reverse=True)
+        return fused_docs[:top_k] if top_k else fused_docs
+
+
+
     async def _keyword_search_chunks(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
         """
         Performs a precise keyword (phrase) search on the 'chunk_text' field.
+        Searches all indexes concurrently when multiple indexes are configured.
         """
         if not query:
             print("Keyword search skipped: No query provided.")
             return []
 
         keyword_query = {
-            "match_phrase": {
+            "match": {
                 "chunk_text": {
-                    "query": query
+                    "query": query,
+                    "operator": "or",
+                    "fuzziness": "AUTO"
                 }
             }
         }
-        index_name = self.config.get('index_name')
-        print(f"Performing keyword (match_phrase) search with top_k={top_k}. Query: {query}")
+        print(f"Performing keyword (match) search with top_k={top_k}. Query: {query}")
 
-        try:
-            response = await self.es_client.search(
-                index=index_name,
-                query=keyword_query,
-                size=top_k,
-                _source_includes=["chunk_text", "metadata.file_name", "metadata.doc_id", "metadata.page_number", "metadata.chunk_index_in_page"]
-            )
-            results = []
-            for hit in response.get('hits', {}).get('hits', []):
-                source = hit.get('_source', {})
-                metadata = source.get('metadata', {})
-                results.append({
-                    "id": hit.get('_id'),
-                    "text": source.get('chunk_text'),
-                    "score": hit.get('_score'),
-                    "file_name": metadata.get('file_name'),
-                    "doc_id": metadata.get('doc_id'),
-                    "page_number": metadata.get('page_number'),
-                    "chunk_index_in_page": metadata.get('chunk_index_in_page')
-                })
-            print(f"Keyword search found {len(results)} chunks.")
-            return results
-        except TransportError as e:
-            print(f"Elasticsearch keyword search error: {e}")
-            return []
-    
+        async def search_single_index(index_name: str) -> List[Dict[str, Any]]:
+            """Search a single index and return results with all fields."""
+            # Known fields to exclude from custom_fields
+            KNOWN_FIELDS = {'chunk_text', 'embedding', 'metadata'}
+            
+            try:
+                response = await self.es_client.search(
+                    index=index_name,
+                    query=keyword_query,
+                    size=top_k,
+                    _source_excludes=["embedding"]  # Retrieve all fields except embedding
+                )
+                results = []
+                for hit in response.get('hits', {}).get('hits', []):
+                    source = hit.get('_source', {})
+                    metadata = source.get('metadata', {})
+                    
+                    # Extract custom fields (fields not in KNOWN_FIELDS)
+                    custom_fields = {k: v for k, v in source.items() if k not in KNOWN_FIELDS}
+                    
+                    results.append({
+                        "id": hit.get('_id'),
+                        "source_index": index_name,  # Track which index this came from
+                        "text": source.get('chunk_text'),
+                        "score": hit.get('_score'),
+                        "file_name": metadata.get('file_name'),
+                        "doc_id": metadata.get('doc_id'),
+                        "page_number": metadata.get('page_number'),
+                        "chunk_index_in_page": metadata.get('chunk_index_in_page'),
+                        "custom_fields": custom_fields
+                    })
+                print(f"Keyword search found {len(results)} chunks in {index_name}.")
+                return results
+            except TransportError as e:
+                print(f"Elasticsearch keyword search error for {index_name}: {e}")
+                return []
+        
+        # Search all indexes concurrently
+        search_tasks = [search_single_index(idx) for idx in self.index_names]
+        results_lists = await asyncio.gather(*search_tasks, return_exceptions=True)
+        
+        # Merge results - use composite key (source_index + id) for deduplication
+        all_results = []
+        seen_composite_ids = set()
+        for result in results_lists:
+            if isinstance(result, Exception):
+                print(f"Keyword search task failed: {result}")
+                continue
+            if isinstance(result, list):
+                for item in result:
+                    # Use composite key: source_index + document_id
+                    composite_key = f"{item.get('source_index', '')}:{item['id']}"
+                    if composite_key not in seen_composite_ids:
+                        seen_composite_ids.add(composite_key)
+                        all_results.append(item)
+        
+        # Sort by score and return top_k
+        all_results.sort(key=lambda x: x.get('score', 0) or 0, reverse=True)
+        print(f"Keyword search found {len(all_results)} chunks across {len(self.index_names)} indexes.")
+        return all_results[:top_k]
+
     async def _keyword_search_kg(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
         """
         Performs a keyword search and retrieves full knowledge graph data.
@@ -682,7 +855,8 @@ class RAGFusionRetriever:
             for hit in response.get('hits', {}).get('hits', []):
                 source = hit.get('_source', {})
                 metadata = source.get('metadata', {})
-                results.append({
+                
+                result_item = {
                     "id": hit.get('_id'),
                     "chunk_text": source.get('chunk_text'),
                     "entities": metadata.get('entities', []),
@@ -692,11 +866,15 @@ class RAGFusionRetriever:
                     "doc_id": metadata.get('doc_id'),
                     "page_number": metadata.get('page_number'),
                     "chunk_index_in_page": metadata.get('chunk_index_in_page')
-                })
+                }
+                
+                results.append(result_item)
+                
+            print(f"KG keyword search found {len(results)} chunks.")
             return results
         except TransportError as e:
             print(f"Elasticsearch KG keyword search error: {e}")
-            return []
+        return []
 
     async def _rerank_documents(self, query: str, documents: List[Dict[str, Any]], doc_type: str, absolute_score_floor: float = 0.3) -> List[Dict[str, Any]]:
         if not documents:
@@ -722,7 +900,7 @@ class RAGFusionRetriever:
             return documents
 
         try:
-            scores = await asyncio.to_thread(self.reranker.predict, pairs, batch_size=8,activation_fct=torch.nn.Sigmoid())
+            scores = await asyncio.to_thread(self.reranker.predict, pairs, batch_size=8)
             print(f"Successfully got scores for {len(pairs)} pairs for {doc_type} reranking.")
         except Exception as e:
             print(f"Error during reranking {doc_type} documents with CrossEncoder: {e}")
@@ -818,8 +996,8 @@ class RAGFusionRetriever:
             print(f"Could not generate embedding for subquery: '{subquery_text}'. KG search will yield no results.")
             return []
         query_embedding = embedding_list[0]  # Get the first embedding if multiple texts were passed
-        return await self._structured_kg_search(query_embedding, top_k, top_k_entities)
-
+        # return await self._structured_kg_search(query_embedding, top_k, top_k_entities)
+        return []
 
     def _generate_shorthand_id(self, item: Dict[str, Any], prefix: str, index: int) -> str:
         doc_id_part = "unknown"
@@ -835,7 +1013,13 @@ class RAGFusionRetriever:
         return f"{prefix}_{doc_id_part}_p{page_num_part}_i{chunk_idx_part}"
 
     def _format_search_results_for_llm(self, original_query: str, sub_queries_results: List[Dict[str, Any]]) -> str:
-        lines = [f"Original Query: {original_query}\n"]
+        lines = [
+            "=== ORIGINAL USER QUERY ===",
+            original_query,
+            "",
+            "=== RETRIEVAL CONTEXT GROUPED BY SUBQUERY ===",
+            "",
+        ]
         
         if not sub_queries_results:
             lines.append("No search results found.")
@@ -843,9 +1027,29 @@ class RAGFusionRetriever:
 
         for sq_idx, sq_result in enumerate(sub_queries_results):
             sub_query_text = sq_result.get("sub_query_text", f"Sub-query {sq_idx + 1}")
-            lines.append(f"--- Results for Sub-query: \"{sub_query_text}\" ---")
-
             reranked_chunks = sq_result.get("reranked_chunks", [])
+            retrieved_kg_data = sq_result.get("retrieved_kg_data", [])
+
+            lines.append(f"--- SUBQUERY {sq_idx + 1} ---")
+            lines.append(f"Subquery: {sub_query_text}")
+            lines.append(f"Retrieved chunk count: {len(reranked_chunks)}")
+            lines.append(f"Retrieved KG item count: {len(retrieved_kg_data)}")
+
+            
+            # Create a mapping of KG data by (source_index, file_name, page_number, chunk_index_in_page)
+            # Include source_index to preserve KG data from different indexes
+            kg_by_location = {}
+            for kg_item in retrieved_kg_data:
+                if not isinstance(kg_item, dict):
+                    continue
+                source_index = kg_item.get('source_index', '')
+                file_name = kg_item.get('file_name', '')
+                page_number = kg_item.get('page_number')
+                chunk_index = kg_item.get('chunk_index_in_page')
+                # Include source_index in key for multi-index support
+                key = (source_index, file_name, page_number, chunk_index)
+                kg_by_location[key] = kg_item
+            
             if reranked_chunks:
                 lines.append("\nVector Search Results (Chunks):")
                 for chunk_idx, chunk in enumerate(reranked_chunks):
@@ -861,242 +1065,61 @@ class RAGFusionRetriever:
                     text_content = chunk.get("text") or chunk.get("chunk_text", "N/A")
                     lines.append(text_content)
                     lines.append(f"  File: {chunk.get('file_name', 'N/A')}, Page: {chunk.get('page_number', 'N/A')}, Chunk Index in Page: {chunk.get('chunk_index_in_page', 'N/A')}")
+                    
+                    # Display custom fields if present
+                    custom_fields = chunk.get('custom_fields', {})
+                    if custom_fields:
+                        lines.append("  Custom Fields:")
+                        for field_name, field_value in custom_fields.items():
+                            lines.append(f"    {field_name}: {field_value}")
+                    
+                    # Check if there's KG data for this chunk
+                    # The chunk's source_index is the main index (e.g., 'fields_test')
+                    # The KG's source_index is the KG index (e.g., 'fields_test_kg_index')
+                    # We need to map chunk's index to corresponding KG index name
+                    chunk_source_index = chunk.get('source_index', '')
+                    # Derive the expected KG index name from chunk's source index
+                    expected_kg_source_index = f"{chunk_source_index}_kg_index" if chunk_source_index else ''
+                    chunk_file = chunk.get('file_name', '')
+                    chunk_page = chunk.get('page_number')
+                    chunk_index = chunk.get('chunk_index_in_page')
+                    # Use the derived KG index name for lookup
+                    chunk_key = (expected_kg_source_index, chunk_file, chunk_page, chunk_index)
+                    
+                    if chunk_key in kg_by_location:
+                        kg_item = kg_by_location[chunk_key]
+                        score_val = kg_item.get('rerank_score', kg_item.get('score'))
+                        score_str = f"{score_val:.4f}" if score_val is not None else "N/A"
+                        
+                        lines.append(f"  Knowledge Graph for this chunk (Score: {score_str}):")
+                        
+                        entities = kg_item.get("entities", [])
+                        if entities:
+                            lines.append("    Entities:")
+                            for entity in entities:
+                                if not isinstance(entity, dict): continue
+                                lines.append(f"      - Name: {entity.get('name', 'N/A')}, Type: {entity.get('type', 'N/A')}")
+                                entity_desc = entity.get('description', '')
+                                if entity_desc:
+                                    lines.append(f"        Description: {entity_desc}")
+                        
+                        relationships = kg_item.get("relationships", [])
+                        if relationships:
+                            lines.append("    Relationships:")
+                            for rel in relationships:
+                                if not isinstance(rel, dict): continue
+                                lines.append(f"      - {rel.get('source_entity', 'S')} -> {rel.get('relation', 'R')} -> {rel.get('target_entity', 'T')} (Weight: {rel.get('relationship_weight', 'N/A')})")
+                                rel_desc = rel.get("relationship_description", "")
+                                if rel_desc:
+                                    lines.append(f"        Description: {rel_desc}")
+                    
+                    lines.append("")  # Blank line between chunks
             else:
                 lines.append("\nNo vector search results for this sub-query.")
-
-            retrieved_kg_data = sq_result.get("retrieved_kg_data", []) # This is `final_kg_evidence_for_output`
-            if retrieved_kg_data:
-                lines.append("\nKnowledge Graph Results:")
-                for kg_idx, kg_item in enumerate(retrieved_kg_data):
-                    if not isinstance(kg_item, dict):
-                        print(f"Skipping non-dict kg_item during formatting: {kg_item}")
-                        continue
-                    
-                    shorthand_id = self._generate_shorthand_id(kg_item, "kg", kg_idx)
-                    score_val = kg_item.get('rerank_score', kg_item.get('score')) # KG items might also have rerank_score
-                    score_str = f"{score_val:.4f}" if score_val is not None else "N/A"
-                    lines.append(f"Source ID [{shorthand_id}]: (Score: {score_str})")
-                    lines.append(f"  File: {kg_item.get('file_name', 'N/A')}, Page: {kg_item.get('page_number', 'N/A')}, Chunk Index in Page: {kg_item.get('chunk_index_in_page', 'N/A')}")
-
-                    entities = kg_item.get("entities", [])
-                    if entities:
-                        lines.append("  Entities:")
-                        for entity in entities:
-                            if not isinstance(entity, dict): continue
-                            lines.append(f"    - Name: {entity.get('name', 'N/A')}, Type: {entity.get('type', 'N/A')}")
-                            entity_desc = entity.get('description', '')
-                            if entity_desc:
-                                lines.append(f"      Description: {entity_desc}")
-                    
-                    relationships = kg_item.get("relationships", [])
-                    if relationships:
-                        lines.append("  Relationships:")
-                        for rel in relationships:
-                            if not isinstance(rel, dict): continue
-                            lines.append(f"    - {rel.get('source_entity', 'S')} -> {rel.get('relation', 'R')} -> {rel.get('target_entity', 'T')} (Weight: {rel.get('relationship_weight', 'N/A')})")
-                            rel_desc=rel.get("relationship_description", "")
-                            if rel_desc:
-                                lines.append(f"    Description:{rel_desc}")
-            
-            else:
-                lines.append("\nNo knowledge graph results for this sub-query.")
             
             lines.append("")
         
         return "\n".join(lines)
-    
-    async def _extract_keywords_for_search(self, user_query: str, schema_chunks: str) -> List[str]:
-        """
-        Uses an LLM to extract the single most relevant keyword from the user query,
-        using a fetched sample document for schema context.
-        """
-        
-        system_prompt = """You are an expert at information retrieval and search query optimization. Your task is to analyze a user's query and the provided data schema to extract the single most essential keyword required to perform a database search."""
-        
-        context_lines = []
-        for fname, chunk in schema_chunks.items():
-            context_lines.append(f"File: {fname}\nSample Chunk: {chunk}\n---")
-        schema_context = "\n".join(context_lines)
-        
-        user_prompt = f"""
-Your goal is to extract the **single most important keyword** from a user's query. This keyword will be used to filter a database. Use the provided file chunk samples to understand the data's structure.
-
----
-**File Chunk Samples**
-{schema_context}
----
-
-**Instructions & Logic**
-1. Analyze the user's query and the file chunk samples.
-2. Identify potential keywords in the query. These can be column names or specific values.
-3. From the potential keywords, select the **single most powerful filtering term**.
-4. **Priority Rule:** A specific value like a person's name, an ID, or a unique term is the highest priority because it narrows down the search the most. A general column header is a lower priority.
-5. Return **only the single best keyword as a plain string**, not in JSON or a list.
-
-**Task**
-Query: "{user_query}"
-Output:
-"""
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-        
-        llm_response_content = ""
-        print(f"Extracting keyword from query via LLM: '{user_query}'")
-        llm_response_content = await self._call_openai_api(
-            model_name=OPENAI_CHAT_MODEL, payload_messages=messages, max_tokens=200, temperature=0.0
-        )
-
-        if not llm_response_content:
-            print("⚠️ LLM returned no keywords. Falling back to using the original query.")
-            return [user_query]
-
-        keyword = llm_response_content.strip()
-        
-        if keyword:
-            # The downstream code expects a list of keywords, so we wrap the single keyword in a list.
-            print(f"✅ Extracted keyword: ['{keyword}']")
-            return [keyword]
-        else:
-            print("⚠️ LLM returned an empty string. Falling back to using the original query.")
-            return [user_query]
-    
-    async def _determine_optimal_chunk_count(self, user_query: str, query_type: str = None) -> int:
-        """
-        Dynamically determines the optimal number of chunks to retrieve based on:
-        1. Query type and complexity
-        2. Database size and characteristics 
-        3. System resource constraints
-        """
-        # Default fallback values if analysis fails
-        default_counts = {
-            'factual_lookup': 5,
-            'summary_extraction': 10,
-            'comparison': 25,
-            'complex_analysis': 30
-        }
-        
-        try:
-            # Get query type if not provided
-            if not query_type:
-                query_type = await self._classify_query_type(user_query)
-            
-            # Step 1: Analyze database size
-            index_name = self.config.get('index_name')
-            index_stats = await self.es_client.count(index=index_name)
-            total_docs = index_stats.get('count', 1000)  # Default assumption if count fails
-            
-            print(f"Database size analysis: {total_docs} total documents in index")
-            
-            # Step 2: Calculate base chunk count based on query type
-            base_count = default_counts.get(query_type, 8)
-            
-            # Step 3: Adjust for database size
-            if total_docs < 1000:
-                # For small databases, retrieve a higher percentage
-                size_adjusted_count = max(base_count, int(total_docs * 0.05))
-            elif total_docs < 10000:
-                # For medium databases
-                size_adjusted_count = max(base_count, int(total_docs * 0.02))
-            else:
-                # For large databases
-                size_adjusted_count = max(base_count, int(total_docs * 0.01))
-                
-            # Step 4: Apply query complexity adjustments
-            complexity_factor = 1.0
-            
-            # Check for indicators of complex queries
-            if len(user_query.split()) > 15:
-                complexity_factor *= 1.3  # Longer queries may need more context
-            
-            if "compare" in user_query.lower() or "difference" in user_query.lower():
-                complexity_factor *= 1.2  # Comparative queries need more context
-                
-            if "list" in user_query.lower() or "all" in user_query.lower():
-                complexity_factor *= 1.4  # Queries asking for comprehensive lists
-                
-            # LLM-based complexity analysis (lightweight version)
-            try:
-                system_prompt = "You are an AI that evaluates query complexity. Rate the following query on a scale from 1 to 10, where 1 is extremely simple and 10 is very complex. Return ONLY the number."
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Query: {user_query}\n\nComplexity rating (1-10):"}
-                ]
-                
-                complexity_response = await self._call_openai_api(
-                    model_name=OPENAI_CHAT_MODEL,
-                    payload_messages=messages,
-                    max_tokens=10,
-                    temperature=0.1
-                )
-                
-                try:
-                    complexity_score = float(complexity_response.strip())
-                    if 1 <= complexity_score <= 10:
-                        # Adjust complexity factor based on LLM score (1.0 to 2.0)
-                        complexity_factor *= (1.0 + (complexity_score - 1) / 9)
-                except (ValueError, TypeError):
-                    pass  # If conversion fails, keep existing complexity factor
-                    
-            except Exception as e:
-                print(f"LLM-based complexity analysis failed: {e}")
-                # Continue with existing complexity factor
-                
-            # Apply complexity factor
-            final_count = int(size_adjusted_count * complexity_factor)
-            
-            # Step 5: Apply practical bounds
-            min_chunks = 3  # Minimum chunks to ensure we get some context
-            max_chunks = 30  # Maximum to prevent excessive resource usage
-            final_count = max(min_chunks, min(final_count, max_chunks))
-            
-            # Step 6: Account for resource constraints
-            resource_limit = self.params.get('max_chunks', 50)
-            final_count = min(final_count, resource_limit)
-            
-            print(f"Dynamic chunk count determination: {final_count} chunks for query type '{query_type}' (complexity factor: {complexity_factor:.2f})")
-            return final_count
-            
-        except Exception as e:
-            print(f"Error in optimal chunk count determination: {e}. Using default value.")
-            return default_counts.get(query_type, 10)
-        
-    async def _generate_final_answer(self, original_query: str, llm_formatted_context: str, cited_files: List[str]) -> str:
-        """Generates the final answer by sending the context to the appropriate LLM."""
-        print("\n--- Generating Final Answer based on Synthesized Context ---")
-        
-        if not llm_formatted_context or not llm_formatted_context.strip():
-            print("⚠️ Cannot generate final answer: Formatted context is empty.")
-            return "Could not generate an answer because no relevant information was found."
-        
-        user_prompt = USER_PROMPT_TEMPLATE.format(
-        original_query=original_query,
-        context=llm_formatted_context
-        )
-
-        messages = [
-        {"role": "system", "content": SYSTEM_PROMPT_TEMPLATE},
-        {"role": "user", "content": user_prompt}
-    ]
-        max_tokens = 16000
-
-        final_answer = ""
-        print("Default mode: Routing final answer generation to OpenAI API.")
-        final_answer = await self._call_openai_api(
-                model_name=OPENAI_CHAT_MODEL,
-                payload_messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.3
-            )
-        
-        if final_answer:
-            print("✅ Successfully generated final answer.")
-            return final_answer
-        else:
-            error_msg = f"The {OPENAI_CHAT_MODEL} model returned an empty response."
-            print(f"❌ {error_msg}")
-            return error_msg
 
     async def search(
         self,
@@ -1104,66 +1127,85 @@ Output:
         num_subqueries: int = 2,
         initial_candidate_pool_size: int = 50,
         top_k_kg_entities: int = 8,
-        absolute_score_floor: float = 0.3
+        absolute_score_floor: float = 0.3,
+        stream_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
-        print(f"Starting RAG Fusion search for user query: '{user_query}'")
+        print(f"\n{'='*80}")
+        print(f"⏱️  Starting RAG Fusion search for user query: '{user_query[:60]}...'")
+        print(f"{'='*80}\n")
+        retrieval_start_time = time.time()
 
-        schema_chunks = await self._fetch_schema_chunks_by_file()
-        query_type = await self._classify_query_type(user_query)
+        setup_start_time = time.time()
         
-        all_retrieved_chunks: Dict[str, Any] = {}
+        # Direct retrieval — no subquery decomposition needed for WhatsApp-grade latency
+        subquery_data = [{"query": user_query}]
         
-        if query_type == 'factual_lookup':
-            print("-> Factual Lookup: Using single keyword search.")
-            search_keywords = await self._extract_keywords_for_search(user_query, schema_chunks)
-            
-            # For factual lookups, perform a precise keyword search
-            if search_keywords:
-                retrieved_chunks_list = await self._keyword_search_chunks(search_keywords[0], initial_candidate_pool_size)
-                for chunk in retrieved_chunks_list:
-                    all_retrieved_chunks[chunk['id']] = chunk
-        else:
-            print("-> Complex Query: Generating subqueries and running RRF for each.")
-            subqueries = await self._generate_subqueries(user_query, num_subqueries=num_subqueries)
-            subqueries.insert(0, user_query) # Also process the original query
-
-            for sq_text in subqueries:
-                print(f"\n--- Processing Complex Subquery: '{sq_text}' ---")
-                
-                query_embeddings = await self._generate_embedding([sq_text])
-                if not query_embeddings or not query_embeddings[0]:
-                    continue
-                query_embedding = query_embeddings[0]
-
-                # Extract the single most important keyword from the subquery
-                extracted_keywords = await self._extract_keywords_for_search(sq_text, schema_chunks)
-                if not extracted_keywords:
-                    continue
-                single_keyword = extracted_keywords[0]
-
-                # Perform RRF using the full text for vector and the single keyword for keyword search
-                fused_chunks = await self._unified_rrf_search(
-                    query_text=single_keyword,
-                    query_embedding=query_embedding,
-                    top_k=initial_candidate_pool_size,
-                    top_k_entities=top_k_kg_entities
+        setup_duration = time.time() - setup_start_time
+        print(f"✅ Setup completed in {setup_duration:.2f}s\n")
+        
+        print(f"⏱️  [2/3] Processing {len(subquery_data)} subqueries concurrently...")
+        subquery_processing_start = time.time()
+        
+        # Process all subqueries concurrently — each returns ONE internally-fused ranked list
+        all_ranked_lists: List[List[Dict[str, Any]]] = []
+        
+        if subquery_data:
+            subquery_tasks = [
+                self._process_single_subquery(
+                    sq_entry["query"],
+                    initial_candidate_pool_size,
+                    top_k_kg_entities
                 )
-                
-                for chunk in fused_chunks:
-                    if chunk['id'] not in all_retrieved_chunks:
-                        all_retrieved_chunks[chunk['id']] = chunk
+                for sq_entry in subquery_data
+            ]
+            
+            # Execute all subquery processing tasks concurrently
+            subquery_results = await asyncio.gather(*subquery_tasks, return_exceptions=True)
+            
+            for idx, result in enumerate(subquery_results):
+                sq_text = subquery_data[idx]["query"]
+                if isinstance(result, Exception):
+                    print(f"⚠️ Subquery '{sq_text[:50]}...' processing failed: {result}")
+                    continue
+                if isinstance(result, list) and result:
+                    all_ranked_lists.append(result)
+                    print(f"Subquery '{sq_text[:50]}...' contributed 1 fused list ({len(result)} chunks)")
 
-        retrieved_chunks = list(all_retrieved_chunks.values())
+        subquery_processing_duration = time.time() - subquery_processing_start
+        print(f"✅ Subquery processing completed in {subquery_processing_duration:.2f}s")
+        print(f"Total fused lists for cross-subquery RRF: {len(all_ranked_lists)}\n")
+
+        # CROSS-SUBQUERY RRF FUSION (Tier 2)
+        # Each subquery has already normalized its internal signals (semantic + keyword) via
+        # per-subquery RRF (Tier 1). Now fuse across subqueries so documents appearing in
+        # multiple subquery perspectives get properly boosted.
+        print("⏱️  Performing cross-subquery RRF fusion...")
+        rrf_start_time = time.time()
         
+        fused_chunks = self._fuse_ranked_lists_with_rrf(
+            all_ranked_lists,
+            top_k=initial_candidate_pool_size
+        )
+        
+        rrf_fusion_duration = time.time() - rrf_start_time
+        print(f"✅ Unified RRF fusion completed in {rrf_fusion_duration:.2f}s — {len(fused_chunks)} unique chunks after fusion")
+
+        # Separate regular chunks from KG entries
+        retrieved_chunks = []
         retrieved_kg_evidence_with_chunk_text = []
-        original_query_embedding = await self._generate_embedding([user_query])
-        if original_query_embedding and original_query_embedding[0]:
-             retrieved_kg_evidence_with_chunk_text = await self._structured_kg_search(
-                 original_query_embedding[0], initial_candidate_pool_size, top_k_kg_entities
-             )
+        
+        for chunk_data in fused_chunks:
+            if chunk_data.get('entities') or chunk_data.get('relationships'):
+                retrieved_kg_evidence_with_chunk_text.append(chunk_data)
+            else:
+                retrieved_chunks.append(chunk_data)
+        
+        print(f"Separated {len(retrieved_chunks)} chunks and {len(retrieved_kg_evidence_with_chunk_text)} KG entries from unified RRF results")
                 
+        # Deep research: reranking and pruning
+        rerank_start_time = time.time() 
         if self.reranker and self.deep_research:
-            print("Deep research is ON. Reranking and pruning will be applied to the final candidate pool.")
+            print(f"⏱️  [3/3] Deep research is ON. Reranking and pruning the candidate pool...")
             retrieved_chunks = await self._rerank_documents(user_query, retrieved_chunks, "chunk", absolute_score_floor)
             if self.provence_pruner:
                 retrieved_chunks = await self._prune_documents(user_query, retrieved_chunks, "chunk")
@@ -1171,265 +1213,310 @@ Output:
             retrieved_kg_evidence_with_chunk_text = await self._rerank_documents(user_query, retrieved_kg_evidence_with_chunk_text, "kg", absolute_score_floor)
             if self.provence_pruner:
                  retrieved_kg_evidence_with_chunk_text = await self._prune_documents(user_query, retrieved_kg_evidence_with_chunk_text, "kg")
+            rerank_duration = time.time() - rerank_start_time
+            print(f"✅ Reranking and pruning completed in {rerank_duration:.2f}s\n")
+        else:
+            print("⏱️  [3/3] Deep research is OFF. Skipping reranking and pruning.\n")
 
+        # Build unified results for LLM context formatting.
+        # Since all results are globally ranked via a single unified RRF, present as one block.
+        # The original user query is included as context for the LLM.
         final_kg_evidence_for_output = []
         for doc in retrieved_kg_evidence_with_chunk_text:
             doc_copy = doc.copy()
             doc_copy.pop("chunk_text", None)
             final_kg_evidence_for_output.append(doc_copy)
-            
-        processed_subquery_results = [{
-                    "sub_query_text": user_query,
-                    "reranked_chunks": retrieved_chunks,
-                    "retrieved_kg_data": final_kg_evidence_for_output
-                }]
         
         processed_subquery_results = [{
-                    "sub_query_text": user_query,
-                    "reranked_chunks": retrieved_chunks,
-                    "retrieved_kg_data": final_kg_evidence_for_output
-                }]
+            "sub_query_text": user_query,
+            "reranked_chunks": retrieved_chunks,
+            "retrieved_kg_data": final_kg_evidence_for_output
+        }]
+        
+
+        print(f"Prepared {len(processed_subquery_results)} subquery result entries for LLM context")
         
         show_references = self.params.get('enable_references_citations', False)
-        citations_str = ''
-        if show_references:
-            cited_files = set()
-
-            for sq_result in processed_subquery_results:
-                for chunk in sq_result.get("reranked_chunks", []):
-                    if chunk.get("file_name"):
-                        cited_files.add(chunk["file_name"])
-                
-                for kg_item in sq_result.get("retrieved_kg_data", []):
-                    if kg_item.get("file_name"):
-                        cited_files.add(kg_item["file_name"])
-
-            if cited_files:
-                citations_str = (
-                    "\n\n**Sources:**\n"
-                    + "\n".join(f"- {name}" for name in sorted(list(cited_files)))
-                    + "\n\n**Cite Your Sources**: When presenting information, reference its source."
-                    "Place these citations/sources at the end of the relevant sentences or paragraphs to ensure traceability if the response consists of more than one source. "
-                    "Also, include all cited sources again at the end of the response too seprately and highlighted."
-                )
+        candidate_source_files: set[str] = set()
+        for sq_result in processed_subquery_results:
+            for chunk in sq_result.get("reranked_chunks", []):
+                if chunk.get("file_name"):
+                    candidate_source_files.add(chunk["file_name"])
+            for kg_item in sq_result.get("retrieved_kg_data", []):
+                if kg_item.get("file_name"):
+                    candidate_source_files.add(kg_item["file_name"])
 
         final_results_dict = {
             "original_query": user_query,
             "sub_queries_results": processed_subquery_results,
-            "refrences": citations_str
+            "refrences": ""
         }
         
         llm_formatted_context = self._format_search_results_for_llm(
             original_query=user_query,
             sub_queries_results=processed_subquery_results 
         )
-        final_results_dict["llm_formatted_context"] = llm_formatted_context + citations_str
+        final_results_dict["llm_formatted_context"] = llm_formatted_context
+
+        # Mark end of retrieval pipeline
+        retrieval_end_time = time.time()
+        retrieval_duration = retrieval_end_time - retrieval_start_time
+        print(f"\n{'='*80}")
+        print(f"✅ RETRIEVAL PIPELINE COMPLETED in {retrieval_duration:.2f}s")
+        print(f"{'='*80}\n")
+
+        # LLM Call for final Ans
+        print(f"⏱️  [3/3] Generating final answer with LLM...") 
+        llm_generation_start = time.time()
+        cite_instruction = """
+                5.  Cite sources inline at the end of each paragraph using square brackets with file names, e.g. [some_document.pdf]. If multiple files are used in one paragraph, cite all, e.g. [file_one.pdf, file_two.docx].
+        """ if self.params.get("enable_references_citations", False) else ""
+
+        final_call_system_message = f"""
+            ROLE
+            You are a precise assistant that answers using only provided context.
+
+            TASK
+            Provide a clear, complete, mobile-friendly WhatsApp answer.
+
+            STRICT OUTPUT RULES (MUST FOLLOW)
+            1. Never output markdown headers or separators. Forbidden: #, ##, ###, ---, ```.
+            2. Use only plain text paragraphs and bullets that begin with "- ".
+            3. WhatsApp emphasis only: *bold* and _italic_. Do not use **double-asterisk** markdown bold.
+            4. Do not nest emphasis markers and do not leave unmatched markers.
+            5. First visible characters must be normal text (not symbols like # or -).
+            6. Keep paragraphs short and readable on chat screens.
+            7. Stay strictly context-bound; if insufficient context, state that clearly.
+            {cite_instruction}
+
+            Return only the final user-facing answer text in WhatsApp style.
+            """
+
+        if not self.params.get("enable_references_citations", False):
+            print("Citations are disabled. Using a WhatsApp-format prompt without citation instructions.")
+
+        USER_PROMPT_TEMPLATE = """
+            Follow the system rules exactly.
+            ORIGINAL_QUESTION: "{original_query}"
+
+            RECENT_CONVERSATION_START
+            {conversation_history}
+            RECENT_CONVERSATION_END
+
+            CONTEXT_START
+            {context}
+            CONTEXT_END
+
+            ANSWER:
+            """
+        user_prompt = USER_PROMPT_TEMPLATE.format(
+            original_query=user_query,
+            conversation_history=self._render_conversation_history(),
+            context=final_results_dict["llm_formatted_context"]
+        )
+
+        messages = [
+            {"role": "system", "content": final_call_system_message},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        print(f"Generating final structured llm response: '{user_query}'")
+        llm_response_content = ""
+        stream_started = {"value": False}
+
+        async def _safe_stream_callback(delta: str):
+            if not stream_callback:
+                return
+            cleaned_delta = _sanitize_whatsapp_text(
+                delta,
+                strip_leading_markdown=not stream_started["value"],
+            )
+            if not cleaned_delta:
+                return
+            stream_started["value"] = True
+            await stream_callback(cleaned_delta)
+
+        llm_response_content = await self._call_openai_api(
+            model_name=OPENAI_CHAT_MODEL,
+            payload_messages=messages,
+            max_tokens=8000,
+            temperature=0.1,
+            stream_callback=_safe_stream_callback if stream_callback else None,
+        )
+
+        llm_response_content = _sanitize_whatsapp_text(llm_response_content, strip_leading_markdown=True).strip()
+
+        if show_references and llm_response_content:
+            used_source_files = _extract_files_cited_in_answer(llm_response_content, candidate_source_files)
+            if used_source_files:
+                llm_response_content = (
+                    llm_response_content.rstrip()
+                    + "\n\n*Cited Sources:*\n"
+                    + "\n".join(f"- {name}" for name in used_source_files)
+                )
+
+        llm_generation_duration = time.time() - llm_generation_start
+        print(f"✅ Final answer generation completed in {llm_generation_duration:.2f}s\n")
+
+        final_results_dict["final_answer"] = llm_response_content
+        
+        print(f"\n{'='*80}")
+        print(f"📝 FINAL ANSWER:")
+        print(f"{'='*80}")
+        print(llm_response_content)
+        print(f"{'='*80}\n")
+        
+        # Print final timing summary
+        total_time = time.time() - retrieval_start_time
+        print(f" RAG FUSION SEARCH COMPLETED")
+        print(f"Query: '{user_query[:60]}...'")
+        print(f"\n⏱️  TIMING BREAKDOWN:")
+        print(f"  1. Setup (subqueries + keywords):          {setup_duration:.2f}s")
+        print(f"  2. Subquery processing (concurrent):       {subquery_processing_duration:.2f}s")
+        if self.reranker and self.deep_research:
+            print(f"  3. Reranking & pruning:                     {rerank_duration:.2f}s")
+        else:
+            print(f"  3. Reranking & pruning:                     0.00s (skipped)")
+        print(f"  4. LLM final answer generation:             {llm_generation_duration:.2f}s")
+        print(f"\n RETRIEVAL PIPELINE ONLY:  {retrieval_duration:.2f}s")
+        print(f" TOTAL TIME (with LLM):     {total_time:.2f}s")
+        print(f" LLM API CALLS:             2 (setup + final answer)")
+        print(f"\n")
         
         return final_results_dict
 
-async def classify_intent_llm(query: str, aclient_openai: AsyncOpenAI) -> str:
-    """
-    Uses LLM to classify the user's intent.
-    Returns one of: 'greeting', 'irrelevant', 'retrieval'
-    """
-    system_prompt = (
-        "You are an expert intent classifier for a document Q&A bot. "
-        "Classify the user's message as one of the following:\n"
-        "- greeting: If the message is a greeting (hi, hello, hey, etc.)\n"
-        "- irrelevant: If the message is nonsensical, off-topic, or not a real question (e.g., 'asdf', 'what is the color of my socks?', 'tell me a joke', 'who is the president of mars?')\n"
-        "- retrieval: If the message is a real, information-seeking question about the user's documents or data.\n"
-        "Respond ONLY with one of: greeting, irrelevant, retrieval."
-    )
-    user_prompt = f"User message: \"{query.strip()}\""
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
-    try:
-        response = await aclient_openai.chat.completions.create(
-            model=OPENAI_CHAT_MODEL,
-            messages=messages,
-            max_tokens=2,
-            temperature=0.0,
-        )
-        result = response.choices[0].message.content.strip().lower()
-        return result
-    except Exception as e:
-        print(f"LLM intent classifier error: {e}")
-        return "retrieval"
-    
 async def handle_request(data: Message) -> FunctionResponse:
-    """
-    Handles a user query by:
-    - Using LLM to classify intent (greeting, irrelevant, retrieval)
-    - Responding with LLM for greetings/irrelevant queries
-    - Running full RAG pipeline for retrieval queries
-    """
-    es_client: Optional[AsyncElasticsearch] = None
-    aclient_openai: Optional[AsyncOpenAI] = None
+  token = getattr(data, "token", None)
+  params = data.params
+  config = data.config
+  try:
+    es_client = None
+    aclient_openai = None
+    print('Incoming Data:--', data)
+    params = data.params
+    config = data.config
+    token = getattr(data, "token", None)
+    server_type = os.getenv('RAG_SERVER_TYPE')
+    print('server_type:-', server_type)
 
+    es_client = await check_async_elasticsearch_connection()
+    if not es_client:
+      return FunctionResponse(False, "Could not connect to Elasticsearch.")
+
+    text_model = ( params.get('text_model') or config.get('text_model') or config.get('model') or 'gpt-4o-mini' )
+    print('text_model:-', text_model)
+    aclient_openai = await init_async_openai_client(text_model)
+    if not aclient_openai:
+        return FunctionResponse(False, "Could not connect to Open Ai.")
+
+    retriever = RAGFusionRetriever(params, config, es_client, aclient_openai, token)
+    user_query_input = params.get('question') or params.get('query')
+    raw_top_k = params.get('top_k_chunks', 6)
     try:
-        print('Incoming Data:--', data)
-        params = data.params
-        config = data.config
+        top_k_chunks = int(raw_top_k) if raw_top_k is not None else 6
+    except (TypeError, ValueError):
+        top_k_chunks = 6
+    print(f"\n--- Running RAG Fusion Search for: '{user_query_input}' ---")
+    search_results_dict = await retriever.search(
+        user_query=user_query_input, initial_candidate_pool_size=top_k_chunks, top_k_kg_entities=top_k_chunks, absolute_score_floor=0.3
+    )
+    print("\n--- Search Results Dictionary (RAG Fusion: Chunks & KG Reranked if applicable) ---")
+    
+    print("\n--- LLM Formatted Context ---")
+    # print(search_results_dict.get("llm_formatted_context", "No formatted context generated."))
 
-        # Special case: Only generate final answer from provided context
-        if params.get('generate_final_answer') and params.get('context') and params.get('question'):
-            aclient_openai = await init_async_openai_client()
+    if es_client and hasattr(es_client, 'close'):
+      await es_client.close()
+      print("Elasticsearch client closed.")
+    if aclient_openai and hasattr(aclient_openai, "aclose"):
+        print('open ai clinet a close')
+        try:
+          await aclient_openai.aclose()
+          print("OpenAI client closed.")
+        except Exception as e:
+          print(f"Error closing OpenAI client: {e}")
+
+    return FunctionResponse(message=Messages(search_results_dict.get("final_answer", "No formatted context generated.")), failed=False) 
+  except Exception as e:
+    print(f"❌ Error during retrieval: {e}")
+    return FunctionResponse(message=Messages(e))
+
+async def handle_request_stream(data: Message) -> AsyncGenerator[str, None]:
+    token = getattr(data, "token", None)
+    params = data.params
+    config = data.config
+    es_client = None
+    aclient_openai = None
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _on_stream_delta(delta: str):
+        await queue.put(delta)
+
+    async def _run_search():
+        nonlocal es_client, aclient_openai
+        try:
+            es_client = await check_async_elasticsearch_connection()
+            if not es_client:
+                await queue.put("❌ Could not connect to Elasticsearch.")
+                return
+
+            text_model = ( params.get('text_model') or config.get('text_model') or config.get('model') or 'gpt-4o-mini' )
+            aclient_openai = await init_async_openai_client(text_model)
             if not aclient_openai:
-                return FunctionResponse(False, "Could not connect to OpenAI for final answer generation.")
+                await queue.put("❌ Could not connect to OpenAI.")
+                return
 
-            retriever = RAGFusionRetriever(params, config, None, aclient_openai)
-            context = params.get('context')
-            query = params.get('question')
-
-            # Extract cited files from context if available
-            cited_files = []
-            if "**Sources:**" in context:
-                sources_section = context.split("**Sources:**")[1].split("\n\n")[0]
-                cited_files = [line.replace("- ", "").strip() for line in sources_section.strip().split("\n")]
-
-            final_answer = await retriever._generate_final_answer(
-                original_query=query,
-                llm_formatted_context=context,
-                cited_files=cited_files
-            )
-
-            if aclient_openai and hasattr(aclient_openai, "aclose"):
-                await aclient_openai.aclose()
-                print("OpenAI client closed.")
-
-            return FunctionResponse(message=Messages({"final_answer": final_answer}), failed=False)
-
-        # --- Regular search request processing ---
-        es_client = await get_es_client()
-        if not es_client:
-            return FunctionResponse(False, "Could not connect to Elasticsearch.")
-
-        aclient_openai = await init_async_openai_client()
-        if not aclient_openai:
-            return FunctionResponse(False, "Could not connect to Open Ai.")
-
-        retriever = RAGFusionRetriever(params, config, es_client, aclient_openai)
-        user_query_input = params.get('question', '').strip()
-
-        # --- LLM Intent Classification ---
-        intent = await classify_intent_llm(user_query_input, aclient_openai)
-        print(f"LLM classified intent: {intent}")
-
-        if intent == "greeting":
-            # Friendly greeting response
-            system_prompt = (
-                "You are a friendly, helpful AI assistant for RagsApp. "
-                "If the user greets you, respond with a warm, concise greeting and offer to help with questions about their documents or data."
-            )
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_query_input}
-            ]
-            response = await aclient_openai.chat.completions.create(
-                model=OPENAI_CHAT_MODEL,
-                messages=messages,
-                max_tokens=60,
-                temperature=0.7,
-            )
-            greeting_response = response.choices[0].message.content.strip()
-            if aclient_openai and hasattr(aclient_openai, "aclose"):
-                await aclient_openai.aclose()
-            return FunctionResponse(message=Messages({"final_answer": greeting_response}), failed=False)
-
-        if intent == "irrelevant":
-            # Polite fallback for nonsense/irrelevant queries
-            system_prompt = (
-                "You are a polite, professional AI assistant for RagsApp. "
-                "If the user's message is nonsensical, off-topic, or not a real question, respond with a gentle message like: "
-                "'I'm here to help with questions about your documents or data. Please ask a relevant question.'"
-            )
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_query_input}
-            ]
-            response = await aclient_openai.chat.completions.create(
-                model=OPENAI_CHAT_MODEL,
-                messages=messages,
-                max_tokens=60,
-                temperature=0.7,
-            )
-            fallback_response = response.choices[0].message.content.strip()
-            if aclient_openai and hasattr(aclient_openai, "aclose"):
-                await aclient_openai.aclose()
-            return FunctionResponse(message=Messages({"final_answer": fallback_response}), failed=False)
-
-        # --- Retrieval intent: Run full RAG pipeline ---
-        query_type = await retriever._classify_query_type(user_query_input)
-        top_k_chunks = await retriever._determine_optimal_chunk_count(user_query_input, query_type)
-
-        print(f"\n--- Running RAG Fusion Search for: '{user_query_input}' ---")
-        search_results_dict = await retriever.search(
-            user_query=user_query_input,
-            initial_candidate_pool_size=top_k_chunks,
-            top_k_kg_entities=top_k_chunks,
-            absolute_score_floor=0.3
-        )
-        print("\n--- Search Results Dictionary (RAG Fusion: Chunks & KG Reranked if applicable) ---")
-
-        if es_client and hasattr(es_client, 'close'):
-            await es_client.close()
-            print("Elasticsearch client closed.")
-        if aclient_openai and hasattr(aclient_openai, "aclose"):
+            retriever = RAGFusionRetriever(params, config, es_client, aclient_openai, token)
+            user_query_input = params.get('question') or params.get('query')
+            raw_top_k = params.get('top_k_chunks', 6)
             try:
-                await aclient_openai.aclose()
-                print("OpenAI client closed.")
-            except Exception as e:
-                print(f"Error closing OpenAI client: {e}")
+                top_k_chunks = int(raw_top_k) if raw_top_k is not None else 6
+            except (TypeError, ValueError):
+                top_k_chunks = 6
 
-        if search_results_dict is None:
-            print("❌ Warning: search_results_dict is None")
-            return FunctionResponse(message=Messages("An error occurred during search. No results returned."), failed=True)
-
-        # For direct queries, generate final answer automatically
-        if not params.get('skip_final_answer', False):
-            llm_formatted_context = search_results_dict.get("llm_formatted_context", "")
-            cited_files = []
-            if "refrences" in search_results_dict:
-                refs_text = search_results_dict["refrences"]
-                if refs_text and "**Sources:**" in refs_text:
-                    sources_section = refs_text.split("**Sources:**")[1].split("\n\n")[0]
-                    cited_files = [line.replace("- ", "").strip() for line in sources_section.strip().split("\n")]
-
-            # Generate final answer
-            aclient_openai = await init_async_openai_client()
-            if aclient_openai:
-                retriever = RAGFusionRetriever(params, config, None, aclient_openai)
-                final_answer = await retriever._generate_final_answer(
-                    original_query=user_query_input,
-                    llm_formatted_context=llm_formatted_context,
-                    cited_files=cited_files
-                )
-                if aclient_openai and hasattr(aclient_openai, "aclose"):
+            await retriever.search(
+                user_query=user_query_input,
+                initial_candidate_pool_size=top_k_chunks,
+                top_k_kg_entities=top_k_chunks,
+                absolute_score_floor=0.3,
+                stream_callback=_on_stream_delta,
+            )
+        except Exception as e:
+            print(f"❌ Streaming retrieval failed: {e}")
+            await queue.put(f"❌ Error: {e}")
+        finally:
+            if es_client and hasattr(es_client, 'close'):
+                await es_client.close()
+            if aclient_openai and hasattr(aclient_openai, "aclose"):
+                try:
                     await aclient_openai.aclose()
-                return FunctionResponse(message=Messages({"final_answer": final_answer}), failed=False)
+                except Exception as e:
+                    print(f"Error closing OpenAI client: {e}")
+            await queue.put(None)
 
-        # If skip_final_answer is true or if we couldn't generate one, return formatted context
-        return FunctionResponse(message=Messages(search_results_dict.get("llm_formatted_context", "No formatted context generated.")), failed=False)
-
-    except Exception as e:
-        print(f"❌ Error during retrieval: {e}")
-        return FunctionResponse(message=Messages({"error": str(e)}),failed=True)
+    runner = asyncio.create_task(_run_search())
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield str(item)
+    finally:
+        await runner
 
 def test_query():
     params = {
-        "question": "giv me messbill from room no 106 and 107 in tabular form",
-        "top_k_chunks": 5,
-        "enable_references_citations": True,
-        "deep_research": False,
+        "question": "what was the audit observation by pavankumar for security",
+        "top_k_chunks": 15,
+        "enable_references_citations": False,
+        "deep_research": False
     }
     config = {
-        "index_name": "ragsapp",
+        "index_name": "minera-audit",
     }
     message = Message(params=params, config=config)
     res = asyncio.run(handle_request(message))
-    # print('res of handle request:-', res)
+    print('\n\n=== FINAL ANSWER ===\n', res.message.message)
 
 if __name__ == "__main__":
     test_query()
