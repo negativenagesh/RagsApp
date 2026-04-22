@@ -1,3 +1,7 @@
 fastapi
 httpx
 python-dotenv
+openai
+elasticsearch
+duckduckgo-search
+google-genai
