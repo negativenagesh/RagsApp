@@ -1,4 +1,7 @@
-from bson import ObjectId
+try:
+    from bson import ObjectId
+except ImportError:
+    ObjectId = ()
 
 class Messages:
     def __init__(self, message, ignore=False):
@@ -7,9 +10,6 @@ class Messages:
 
     def __str__(self):
         return f"Message(message={self.message}, ignore='{self.ignore}')"
-
-    def to_dict(self):
-        return {"message": self.message, "ignore": self.ignore}
 
     def to_dict(self):
         return {"message": self._convert_objectid(self.message), "ignore": self.ignore}
